@@ -1,0 +1,30 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.venv-py39-backup-*/
+
+# Local environment files
+.env
+.env.*
+
+# Logs and local runtime artifacts
+*.log
+*.pid
+
+# Runtime market recordings
+data/market_recordings/
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+
