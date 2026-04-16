@@ -300,7 +300,7 @@ def format_duration(total_seconds: float) -> str:
 def print_banner(asset: str, output_path: Path | None, *, max_markets: int, write_csv: bool) -> None:
     width = max(88, min(shutil.get_terminal_size((120, 40)).columns, 140))
     run_mode = "forever" if max_markets == 0 else str(max_markets)
-    emit(color("POLYMARKET LIVE PAPER TRADER", "bold"))
+    emit(color("POLYMARKET LIVE PAPER TRADER  Version 2.0", "bold"))
     emit(color("-" * width, "dim"))
     emit(
         f"{color('Asset:', 'dim')} {color(asset, 'cyan')}  "
@@ -2032,7 +2032,7 @@ class LivePaperStrategy:
         events = Text("\n".join(self._recent_events) if self._recent_events else "No paper trades yet.")
 
         return Group(
-            Panel(summary, title="Session", border_style="cyan"),
+            Panel(summary, title="Session  |  Version 2.0", border_style="cyan"),
             Panel(underlying, title="Underlying", border_style="blue"),
             Panel(books, title="Live Book vs Fair", border_style="green"),
             Panel(Text.from_ansi(prob_chart), title="Probability Chart", border_style="magenta"),
