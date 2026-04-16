@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -44,7 +44,13 @@ CHAINLINK_LIVE_QUERY = "LIVE_STREAM_REPORTS_QUERY"
 DISCOVERY_LIMIT = 600
 DISCOVERY_TAGS = frozenset({"up-or-down", "5M", "recurring"})
 WINDOW_DURATION = timedelta(minutes=5)
+RECURRING_MARKET_STEP_SECONDS = int(WINDOW_DURATION.total_seconds())
 NETWORK_RECOVERY_SLEEP_SECONDS = 300
+OFFICIAL_RESOLUTION_PRICE_THRESHOLD = 0.99
+PAPER_TRADE_NOTIONAL_USD = 1.0
+MARKET_ORDER_EXECUTION_DELAY_SECONDS = 0.5
+MARKET_ORDER_TRACE_DELAYS_SECONDS = (0.0, 0.25, 0.5, 0.75)
+NO_NEW_TRADES_LAST_SECONDS = 5.0
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -102,6 +108,13 @@ class UnderlyingQuote:
     bid: str
     ask: str
     raw_json: str
+
+
+@dataclass(frozen=True)
+class OfficialResolution:
+    up_wins: bool
+    price_to_beat: float | None = None
+    final_price: float | None = None
 
 
 @dataclass(frozen=True)
@@ -655,6 +668,130 @@ def parse_outcome_labels(raw_outcomes: str | list[str] | None) -> tuple[str, str
     return first, second
 
 
+def parse_float_values(raw_values: str | list[Any] | None) -> list[float]:
+    if raw_values is None:
+        return []
+    if isinstance(raw_values, str):
+        try:
+            values = json.loads(raw_values)
+        except json.JSONDecodeError:
+            return []
+    else:
+        values = raw_values
+    if not isinstance(values, list):
+        return []
+
+    parsed: list[float] = []
+    for value in values:
+        numeric = float_or_none(value)
+        if numeric is not None:
+            parsed.append(numeric)
+    return parsed
+
+
+def first_json_object(payload: Any) -> dict[str, Any] | None:
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                return item
+    return None
+
+
+def recurring_previous_slug(slug: str) -> str | None:
+    prefix, separator, suffix = slug.rpartition("-")
+    if not prefix or separator != "-":
+        return None
+    try:
+        start_stamp = int(suffix)
+    except ValueError:
+        return None
+    previous_start_stamp = start_stamp - RECURRING_MARKET_STEP_SECONDS
+    if previous_start_stamp <= 0:
+        return None
+    return f"{prefix}-{previous_start_stamp}"
+
+
+def fetch_event_by_slug(slug: str) -> dict[str, Any] | None:
+    payload = http_json(
+        f"{GAMMA_API_BASE}/events",
+        params={"slug": slug},
+        timeout=20,
+    )
+    return first_json_object(payload)
+
+
+def extract_official_resolution(event_payload: dict[str, Any]) -> OfficialResolution | None:
+    metadata = event_payload.get("eventMetadata")
+    if isinstance(metadata, dict):
+        price_to_beat = float_or_none(metadata.get("priceToBeat"))
+        final_price = float_or_none(metadata.get("finalPrice"))
+        if price_to_beat is not None and final_price is not None:
+            return OfficialResolution(
+                up_wins=final_price >= price_to_beat,
+                price_to_beat=price_to_beat,
+                final_price=final_price,
+            )
+
+    markets = event_payload.get("markets")
+    if not isinstance(markets, list) or not markets:
+        return None
+    market = markets[0]
+    if not isinstance(market, dict):
+        return None
+
+    outcome_labels = parse_outcome_labels(market.get("outcomes"))
+    outcome_prices = parse_float_values(market.get("outcomePrices"))
+    if outcome_labels is None or len(outcome_prices) != 2:
+        return None
+
+    for label, price in zip(outcome_labels, outcome_prices, strict=True):
+        if price >= OFFICIAL_RESOLUTION_PRICE_THRESHOLD or math.isclose(price, 1.0, abs_tol=1e-9):
+            return OfficialResolution(up_wins=label.lower() == "up")
+    return None
+
+
+def describe_resolution_poll(event_payload: dict[str, Any]) -> str:
+    metadata = event_payload.get("eventMetadata")
+    metadata_keys = sorted(metadata.keys()) if isinstance(metadata, dict) else []
+
+    markets = event_payload.get("markets")
+    market = markets[0] if isinstance(markets, list) and markets and isinstance(markets[0], dict) else {}
+
+    outcome_prices = market.get("outcomePrices")
+    if isinstance(outcome_prices, str):
+        outcome_prices_text = outcome_prices
+    elif isinstance(outcome_prices, list):
+        outcome_prices_text = json.dumps(outcome_prices, separators=(",", ":"))
+    else:
+        outcome_prices_text = "-"
+
+    return (
+        f"closed={event_payload.get('closed')} "
+        f"active={event_payload.get('active')} "
+        f"uma={market.get('umaResolutionStatus') or '-'} "
+        f"uma_hist={market.get('umaResolutionStatuses') or '-'} "
+        f"outcomePrices={outcome_prices_text} "
+        f"metadataKeys={','.join(metadata_keys) if metadata_keys else '-'}"
+    )
+
+
+def fetch_previous_market_reference(market: MarketWindow) -> tuple[float, str] | None:
+    previous_slug = recurring_previous_slug(market.slug)
+    if previous_slug is None:
+        return None
+
+    previous_event = fetch_event_by_slug(previous_slug)
+    if previous_event is None:
+        return None
+
+    resolution = extract_official_resolution(previous_event)
+    if resolution is None or resolution.final_price is None:
+        return None
+    return resolution.final_price, previous_slug
+
+
 def fetch_chainlink_quotes(
     config: UnderlyingConfig,
     *,
@@ -895,7 +1032,11 @@ def discover_next_market(
             window_end = parse_iso_datetime(market.get("endDate"))
             if window_end is None or window_end <= now:
                 continue
-            window_start = window_end - WINDOW_DURATION
+            window_start = (
+                parse_iso_datetime(market.get("eventStartTime"))
+                or parse_iso_datetime(event.get("startTime"))
+                or (window_end - WINDOW_DURATION)
+            )
             if require_future_start and window_start <= now:
                 continue
 
@@ -937,6 +1078,102 @@ def compute_best_price(levels: list[dict[str, Any]], *, reverse: bool = False) -
     if not prices:
         return ""
     return f"{(max(prices) if reverse else min(prices)):.6f}"
+
+
+def compute_best_level(levels: list[dict[str, Any]], *, reverse: bool = False) -> tuple[float | None, float | None]:
+    best_price: float | None = None
+    best_size: float | None = None
+    for level in levels:
+        if not isinstance(level, dict):
+            continue
+        price = float_or_none(level.get("price"))
+        size = float_or_none(level.get("size"))
+        if price is None or size is None:
+            continue
+        if best_price is None or (price > best_price if reverse else price < best_price):
+            best_price = price
+            best_size = size
+    return best_price, best_size
+
+
+def normalize_book_levels(levels: list[dict[str, Any]], *, reverse: bool = False) -> list[tuple[float, float]]:
+    normalized: list[tuple[float, float]] = []
+    for level in levels:
+        if not isinstance(level, dict):
+            continue
+        price = float_or_none(level.get("price"))
+        size = float_or_none(level.get("size"))
+        if price is None or size is None or price <= 0 or size <= 0:
+            continue
+        normalized.append((price, size))
+    normalized.sort(key=lambda item: item[0], reverse=reverse)
+    return normalized
+
+
+def fill_buy_for_notional(
+    asks: list[tuple[float, float]],
+    *,
+    target_notional: float,
+) -> tuple[float, float, float] | None:
+    remaining_notional = target_notional
+    bought_shares = 0.0
+    spent = 0.0
+    fee = 0.0
+
+    for price, size in asks:
+        if remaining_notional <= 1e-9:
+            break
+        level_notional = price * size
+        buy_notional = min(level_notional, remaining_notional)
+        buy_shares = buy_notional / price
+        bought_shares += buy_shares
+        spent += buy_notional
+        fee += approx_crypto_5m_taker_fee_per_share(price) * buy_shares
+        remaining_notional -= buy_notional
+
+    if remaining_notional > 1e-9 or bought_shares <= 1e-9:
+        return None
+    return bought_shares, spent, fee
+
+
+def fill_sell_for_notional(
+    bids: list[tuple[float, float]],
+    *,
+    target_notional: float,
+    max_shares: float,
+    allow_partial_position: bool = False,
+) -> tuple[float, float, float] | None:
+    remaining_notional = target_notional
+    remaining_shares = max_shares
+    sold_shares = 0.0
+    gross_proceeds = 0.0
+    fee = 0.0
+
+    for price, size in bids:
+        if remaining_shares <= 1e-9:
+            break
+        available_shares = min(size, remaining_shares)
+        if available_shares <= 1e-9:
+            continue
+        sell_shares = available_shares
+        if not allow_partial_position:
+            sell_shares = min(sell_shares, remaining_notional / price)
+        if sell_shares <= 1e-9:
+            continue
+        gross = sell_shares * price
+        sold_shares += sell_shares
+        gross_proceeds += gross
+        fee += approx_crypto_5m_taker_fee_per_share(price) * sell_shares
+        remaining_shares -= sell_shares
+        remaining_notional -= gross
+        if not allow_partial_position and remaining_notional <= 1e-9:
+            break
+
+    if sold_shares <= 1e-9:
+        return None
+    if not allow_partial_position and remaining_notional > 1e-9:
+        return None
+    return sold_shares, gross_proceeds - fee, fee
 
 
 def float_or_none(value: Any) -> float | None:
@@ -993,6 +1230,8 @@ def build_plotext_chart(
     width: int,
     height: int,
     title: str,
+    x_min: float | None = None,
+    x_max: float | None = None,
     y_min: float | None = None,
     y_max: float | None = None,
 ) -> str:
@@ -1003,8 +1242,16 @@ def build_plotext_chart(
     plt.theme("clear")
     plt.plotsize(width, height)
     plt.title(title)
-    plt.xlabel("seconds")
+    plt.xlabel("sec from start")
     plt.grid(True, True)
+
+    if (
+        x_min is not None
+        and x_max is not None
+        and x_max > x_min
+        and hasattr(plt, "xlim")
+    ):
+        plt.xlim(x_min, x_max)
 
     if y_min is not None and y_max is not None and not math.isclose(y_min, y_max):
         plt.ylim(y_min, y_max)
@@ -1023,7 +1270,11 @@ class BookState:
     asset_id: str
     label: str
     best_bid: float | None = None
+    best_bid_size: float | None = None
     best_ask: float | None = None
+    best_ask_size: float | None = None
+    bid_levels: list[tuple[float, float]] = field(default_factory=list)
+    ask_levels: list[tuple[float, float]] = field(default_factory=list)
     last_trade_price: float | None = None
     updated_at: datetime | None = None
 
@@ -1064,7 +1315,7 @@ class LivePaperStrategy:
         session_performance_stats: SessionPerformanceStats,
         trade_cooldown_seconds: float,
         initial_trade_wait_seconds: float = 30.0,
-        history_points: int = 90,
+        history_points: int | None = None,
     ) -> None:
         self.market = market
         self.recorder = recorder
@@ -1079,6 +1330,9 @@ class LivePaperStrategy:
         self.session_performance_stats = session_performance_stats
         self.trade_cooldown_seconds = trade_cooldown_seconds
         self.initial_trade_wait_seconds = initial_trade_wait_seconds
+        history_limit = history_points
+        if history_limit is None:
+            history_limit = max(int((self.market.window_end - self.market.window_start).total_seconds()) + 5, 90)
         self.trade_count = 0
         self.realized_pnl = 0.0
         self.market_max_buy_alpha_net = 0.0
@@ -1087,13 +1341,16 @@ class LivePaperStrategy:
         self.market_buy_budget_used_usd = 0.0
         self._recent_events: deque[str] = deque(maxlen=8)
         self._last_trade_at: dict[tuple[str, str], datetime] = {}
+        self._pending_order_tasks: dict[str, asyncio.Task[None]] = {}
+        self._initial_trade_pending = False
+        self._late_trade_halt_logged = False
         self._underlying_by_second: deque[tuple[datetime, float]] = deque(maxlen=600)
-        self._history_seconds: deque[datetime] = deque(maxlen=history_points)
-        self._history_fair_up: deque[float] = deque(maxlen=history_points)
-        self._history_up_mid: deque[float] = deque(maxlen=history_points)
-        self._history_up_alpha: deque[float] = deque(maxlen=history_points)
-        self._balance_history_seconds: deque[datetime] = deque(maxlen=history_points)
-        self._history_balance: deque[float] = deque(maxlen=history_points)
+        self._history_seconds: deque[datetime] = deque(maxlen=history_limit)
+        self._history_fair_up: deque[float] = deque(maxlen=history_limit)
+        self._history_up_mid: deque[float] = deque(maxlen=history_limit)
+        self._history_up_alpha: deque[float] = deque(maxlen=history_limit)
+        self._balance_history_seconds: deque[datetime] = deque(maxlen=history_limit)
+        self._history_balance: deque[float] = deque(maxlen=history_limit)
         self._closed_trade_units = 0.0
         self._winning_trade_units = 0.0
         self._buy_trade_count = 0
@@ -1123,6 +1380,306 @@ class LivePaperStrategy:
             if label.lower() == "down":
                 return asset_id
         return self.market.token_ids[1]
+
+    def _pending_order_exists(self, asset_id: str) -> bool:
+        task = self._pending_order_tasks.get(asset_id)
+        return task is not None and not task.done()
+
+    def _current_side_price(self, asset_id: str, side: str) -> float | None:
+        book = self._books[asset_id]
+        if side == "buy":
+            return book.best_ask
+        return book.best_bid
+
+    def _build_market_order_trace_payload(
+        self,
+        *,
+        asset_id: str,
+        side: str,
+        decision_timestamp: datetime,
+        decision_snapshot: dict[str, float | None],
+        samples: list[dict[str, float | str | None]],
+        status: str,
+        executed_shares: float | None = None,
+        executed_price: float | None = None,
+        fee: float | None = None,
+        proceeds_or_notional: float | None = None,
+    ) -> str:
+        payload = {
+            "mode": "delayed_market_order",
+            "asset_id": asset_id,
+            "side": side,
+            "decision_timestamp_utc": decision_timestamp.isoformat(),
+            "decision_snapshot": decision_snapshot,
+            "samples": samples,
+            "status": status,
+            "executed_shares": executed_shares,
+            "executed_price": executed_price,
+            "fee": fee,
+            "notional": proceeds_or_notional,
+        }
+        return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+    def _schedule_market_order(
+        self,
+        *,
+        asset_id: str,
+        side: str,
+        timestamp: datetime,
+        snapshot: dict[str, float | None],
+        note: str,
+        is_initial_trade: bool = False,
+    ) -> None:
+        if self._pending_order_exists(asset_id):
+            return
+        if timestamp + timedelta(seconds=MARKET_ORDER_TRACE_DELAYS_SECONDS[-1]) >= self.market.window_end:
+            return
+        if is_initial_trade and self._initial_trade_pending:
+            return
+
+        if is_initial_trade:
+            self._initial_trade_pending = True
+
+        task = asyncio.create_task(
+            self._execute_delayed_market_order(
+                asset_id=asset_id,
+                side=side,
+                decision_timestamp=timestamp,
+                decision_snapshot=snapshot,
+                note=note,
+                is_initial_trade=is_initial_trade,
+            )
+        )
+        self._pending_order_tasks[asset_id] = task
+
+        def _cleanup(completed: asyncio.Task[None], *, key: str = asset_id, initial: bool = is_initial_trade) -> None:
+            current = self._pending_order_tasks.get(key)
+            if current is completed:
+                self._pending_order_tasks.pop(key, None)
+            if initial and not self.initial_trade_taken:
+                self._initial_trade_pending = False
+
+        task.add_done_callback(_cleanup)
+
+    async def _execute_delayed_market_order(
+        self,
+        *,
+        asset_id: str,
+        side: str,
+        decision_timestamp: datetime,
+        decision_snapshot: dict[str, float | None],
+        note: str,
+        is_initial_trade: bool,
+    ) -> None:
+        samples: list[dict[str, float | str | None]] = []
+        previous_delay = 0.0
+
+        try:
+            for delay in MARKET_ORDER_TRACE_DELAYS_SECONDS:
+                wait_seconds = max(delay - previous_delay, 0.0)
+                previous_delay = delay
+                if wait_seconds > 0:
+                    await asyncio.sleep(wait_seconds)
+
+                sample_time = utc_now()
+                side_price = self._current_side_price(asset_id, side)
+                samples.append(
+                    {
+                        "offset_ms": int(delay * 1000),
+                        "timestamp_utc": sample_time.isoformat(),
+                        "side_price": side_price,
+                    }
+                )
+
+                if not math.isclose(delay, MARKET_ORDER_EXECUTION_DELAY_SECONDS, abs_tol=1e-9):
+                    continue
+
+                if side == "buy":
+                    await self._finalize_delayed_buy(
+                        asset_id=asset_id,
+                        decision_timestamp=decision_timestamp,
+                        decision_snapshot=decision_snapshot,
+                        samples=samples,
+                        note=note,
+                        is_initial_trade=is_initial_trade,
+                    )
+                else:
+                    await self._finalize_delayed_sell(
+                        asset_id=asset_id,
+                        decision_timestamp=decision_timestamp,
+                        decision_snapshot=decision_snapshot,
+                        samples=samples,
+                    )
+        except asyncio.CancelledError:
+            self._recent_events.append(f"Canceled pending {side.upper()} for {self._books[asset_id].label}")
+            raise
+
+    async def _finalize_delayed_buy(
+        self,
+        *,
+        asset_id: str,
+        decision_timestamp: datetime,
+        decision_snapshot: dict[str, float | None],
+        samples: list[dict[str, float | str | None]],
+        note: str,
+        is_initial_trade: bool,
+    ) -> None:
+        position = self._positions[asset_id]
+        book = self._books[asset_id]
+        if (self.market.window_end - utc_now()).total_seconds() <= NO_NEW_TRADES_LAST_SECONDS:
+            self._recent_events.append(
+                f"BUY {book.label} canceled after 500ms: market is inside final {NO_NEW_TRADES_LAST_SECONDS:.0f}s"
+            )
+            return
+        buy_fill = fill_buy_for_notional(book.ask_levels, target_notional=PAPER_TRADE_NOTIONAL_USD)
+        if buy_fill is None:
+            self._recent_events.append(f"BUY {book.label} aborted after 500ms: no full $1 ask fill available")
+            return
+
+        buy_shares, buy_notional, fee = buy_fill
+        total_cost = buy_notional + fee
+        market_exposure = self.current_market_exposure()
+        if (
+            position.shares + buy_shares > self.max_position_shares
+            or self.cash < total_cost
+            or market_exposure + total_cost > self.max_market_exposure_usd
+        ):
+            self._recent_events.append(f"BUY {book.label} aborted after 500ms: balance/exposure limit hit")
+            return
+
+        average_buy_price = buy_notional / buy_shares
+        self.cash -= total_cost
+        self.market_buy_budget_used_usd += total_cost
+        position.shares += buy_shares
+        position.cost_basis += total_cost
+        self.trade_count += 1
+        self._record_buy_alpha(decision_snapshot["buy_alpha_net"])
+        if is_initial_trade:
+            self.initial_trade_taken = True
+        self._last_trade_at[(asset_id, "buy")] = utc_now()
+        self._recent_events.append(
+            f"BUY {book.label} {buy_shares:.4f} for {format_money(buy_notional)} @ {average_buy_price:.4f} after 500ms"
+        )
+        self.recorder.write_paper_trade(
+            asset_id=asset_id,
+            token_label=book.label,
+            action="buy",
+            shares=buy_shares,
+            price=average_buy_price,
+            fee=fee,
+            fair_value=decision_snapshot["fair_value"],
+            market_mid=decision_snapshot["market_mid"],
+            buy_alpha_net=decision_snapshot["buy_alpha_net"],
+            sell_alpha_net=decision_snapshot["sell_alpha_net"],
+            cash_balance=self.cash,
+            realized_pnl=self.realized_pnl,
+            position_shares=position.shares,
+            position_average_cost=position.average_cost,
+            note=note,
+            recorded_at=utc_now(),
+            raw_json=self._build_market_order_trace_payload(
+                asset_id=asset_id,
+                side="buy",
+                decision_timestamp=decision_timestamp,
+                decision_snapshot=decision_snapshot,
+                samples=samples,
+                status="filled",
+                executed_shares=buy_shares,
+                executed_price=average_buy_price,
+                fee=fee,
+                proceeds_or_notional=buy_notional,
+            ),
+        )
+
+    async def _finalize_delayed_sell(
+        self,
+        *,
+        asset_id: str,
+        decision_timestamp: datetime,
+        decision_snapshot: dict[str, float | None],
+        samples: list[dict[str, float | str | None]],
+    ) -> None:
+        position = self._positions[asset_id]
+        book = self._books[asset_id]
+        if (self.market.window_end - utc_now()).total_seconds() <= NO_NEW_TRADES_LAST_SECONDS:
+            self._recent_events.append(
+                f"SELL {book.label} canceled after 500ms: market is inside final {NO_NEW_TRADES_LAST_SECONDS:.0f}s"
+            )
+            return
+        allow_partial_position = (
+            book.best_bid is not None
+            and book.best_bid > 0
+            and position.shares * book.best_bid < PAPER_TRADE_NOTIONAL_USD
+        )
+        sell_fill = fill_sell_for_notional(
+            book.bid_levels,
+            target_notional=PAPER_TRADE_NOTIONAL_USD,
+            max_shares=position.shares,
+            allow_partial_position=allow_partial_position,
+        )
+        if sell_fill is None:
+            self._recent_events.append(f"SELL {book.label} aborted after 500ms: bid depth insufficient")
+            return
+
+        sell_shares, proceeds, fee = sell_fill
+        average_sell_price = (proceeds + fee) / sell_shares
+        cost_removed = position.average_cost * sell_shares
+        realized = proceeds - cost_removed
+        self.cash += proceeds
+        self.realized_pnl += realized
+        position.shares -= sell_shares
+        position.cost_basis -= cost_removed
+        self._record_closed_trade(sell_shares, realized)
+        if position.shares <= 1e-9:
+            position.shares = 0.0
+            position.cost_basis = 0.0
+        self.trade_count += 1
+        self._last_trade_at[(asset_id, "sell")] = utc_now()
+        self._recent_events.append(
+            f"SELL {book.label} {sell_shares:.4f} for {format_money(proceeds + fee)} @ {average_sell_price:.4f} after 500ms"
+        )
+        self.recorder.write_paper_trade(
+            asset_id=asset_id,
+            token_label=book.label,
+            action="sell",
+            shares=sell_shares,
+            price=average_sell_price,
+            fee=fee,
+            fair_value=decision_snapshot["fair_value"],
+            market_mid=decision_snapshot["market_mid"],
+            buy_alpha_net=decision_snapshot["buy_alpha_net"],
+            sell_alpha_net=decision_snapshot["sell_alpha_net"],
+            cash_balance=self.cash,
+            realized_pnl=self.realized_pnl,
+            position_shares=position.shares,
+            position_average_cost=position.average_cost,
+            note="positive bid alpha",
+            recorded_at=utc_now(),
+            raw_json=self._build_market_order_trace_payload(
+                asset_id=asset_id,
+                side="sell",
+                decision_timestamp=decision_timestamp,
+                decision_snapshot=decision_snapshot,
+                samples=samples,
+                status="filled",
+                executed_shares=sell_shares,
+                executed_price=average_sell_price,
+                fee=fee,
+                proceeds_or_notional=proceeds + fee,
+            ),
+        )
+
+    async def cancel_pending_orders(self) -> None:
+        tasks = [task for task in self._pending_order_tasks.values() if not task.done()]
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    def seed_reference_price(self, price: float, *, note: str) -> None:
+        self.start_underlying_price = price
+        self._recent_events.append(f"Reference seeded at {price:.4f} from {note}")
 
     def on_underlying_quote(self, quote: UnderlyingQuote) -> None:
         bid = float_or_none(quote.bid)
@@ -1161,10 +1718,12 @@ class LivePaperStrategy:
             return
 
         message_timestamp = self._message_timestamp(payload)
-        best_bid = compute_best_price(payload.get("bids") if isinstance(payload.get("bids"), list) else [], reverse=True)
-        best_ask = compute_best_price(payload.get("asks") if isinstance(payload.get("asks"), list) else [])
-        book.best_bid = float_or_none(best_bid)
-        book.best_ask = float_or_none(best_ask)
+        bids = payload.get("bids") if isinstance(payload.get("bids"), list) else []
+        asks = payload.get("asks") if isinstance(payload.get("asks"), list) else []
+        book.bid_levels = normalize_book_levels(bids, reverse=True)
+        book.ask_levels = normalize_book_levels(asks)
+        book.best_bid, book.best_bid_size = compute_best_level(bids, reverse=True)
+        book.best_ask, book.best_ask_size = compute_best_level(asks)
         book.last_trade_price = float_or_none(payload.get("last_trade_price") or payload.get("price"))
         book.updated_at = message_timestamp
 
@@ -1273,11 +1832,25 @@ class LivePaperStrategy:
             return None
         return (self.current_balance() / self.session_starting_balance) - 1.0
 
-    def settle(self, *, timestamp: datetime) -> None:
-        if self.start_underlying_price is None or self.latest_underlying_price is None:
-            self._recent_events.append("Settlement skipped: missing underlying reference.")
-            return
-        up_wins = self.latest_underlying_price >= self.start_underlying_price
+    def settle(self, *, timestamp: datetime, official_resolution: OfficialResolution | None = None) -> None:
+        resolution_note = ""
+        if official_resolution is not None:
+            up_wins = official_resolution.up_wins
+            if official_resolution.price_to_beat is not None:
+                self.start_underlying_price = official_resolution.price_to_beat
+            if official_resolution.final_price is not None:
+                self.latest_underlying_price = official_resolution.final_price
+                self.latest_underlying_timestamp = timestamp
+            if official_resolution.price_to_beat is not None and official_resolution.final_price is not None:
+                resolution_note = (
+                    f" ({official_resolution.final_price:.4f} vs {official_resolution.price_to_beat:.4f})"
+                )
+        else:
+            if self.start_underlying_price is None or self.latest_underlying_price is None:
+                self._recent_events.append("Settlement skipped: missing underlying reference.")
+                return
+            up_wins = self.latest_underlying_price >= self.start_underlying_price
+
         for asset_id, position in self._positions.items():
             if position.shares <= 0:
                 continue
@@ -1303,11 +1876,12 @@ class LivePaperStrategy:
                 realized_pnl=self.realized_pnl,
                 position_shares=0.0,
                 position_average_cost=0.0,
-                note=f"resolved {'Up' if up_wins else 'Down'}",
+                note=f"resolved {'Up' if up_wins else 'Down'}{resolution_note}",
                 recorded_at=timestamp,
             )
             self._recent_events.append(
-                f"Settled {label} {position.shares:.0f} @ {payout_per_share:.2f} | realized {format_money(realized)}"
+                f"Settled {label} {position.shares:.0f} @ {payout_per_share:.2f}{resolution_note} | "
+                f"realized {format_money(realized)}"
             )
             position.shares = 0.0
             position.cost_basis = 0.0
@@ -1426,6 +2000,7 @@ class LivePaperStrategy:
             max((timestamp - self.market.window_start).total_seconds(), 0.0)
             for timestamp in self._history_seconds
         ]
+        market_duration_seconds = max((self.market.window_end - self.market.window_start).total_seconds(), 1.0)
         prob_chart = build_plotext_chart(
             x_values=x_values,
             series=[
@@ -1435,6 +2010,8 @@ class LivePaperStrategy:
             width=max(60, min(CONSOLE.size.width - 16, 120)),
             height=12,
             title="Fair Up vs Market Mid",
+            x_min=0.0,
+            x_max=market_duration_seconds,
             y_min=0.0,
             y_max=1.0,
         )
@@ -1447,6 +2024,8 @@ class LivePaperStrategy:
             width=max(60, min(CONSOLE.size.width - 16, 120)),
             height=10,
             title="Net Ask Alpha (Fair - Ask - Fee)",
+            x_min=0.0,
+            x_max=market_duration_seconds,
             y_min=alpha_low - padding,
             y_max=alpha_high + padding,
         )
@@ -1611,25 +2190,39 @@ class LivePaperStrategy:
 
     def _maybe_trade(self, timestamp: datetime) -> None:
         seconds_since_start = (timestamp - self.market.window_start).total_seconds()
+        seconds_remaining = (self.market.window_end - timestamp).total_seconds()
+        queue_cutoff_seconds = NO_NEW_TRADES_LAST_SECONDS + MARKET_ORDER_EXECUTION_DELAY_SECONDS
+        if seconds_remaining <= queue_cutoff_seconds:
+            if not self._late_trade_halt_logged:
+                self._recent_events.append(
+                    f"No new orders queued near expiry: final {NO_NEW_TRADES_LAST_SECONDS:.0f}s trading halt active"
+                )
+                self._late_trade_halt_logged = True
+            return
         for asset_id in (self.up_asset_id, self.down_asset_id):
             snapshot = self.alpha_snapshot(asset_id, timestamp=timestamp)
             position = self._positions[asset_id]
             book = self._books[asset_id]
             if snapshot["buy_alpha_net"] is not None:
                 self.market_max_buy_alpha_net = max(self.market_max_buy_alpha_net, snapshot["buy_alpha_net"])
+
+            buy_fill = fill_buy_for_notional(
+                book.ask_levels,
+                target_notional=PAPER_TRADE_NOTIONAL_USD,
+            )
             if (
                 snapshot["buy_alpha_net"] is not None
-                and book.best_ask is not None
-                and position.shares + self.paper_trade_shares <= self.max_position_shares
+                and buy_fill is not None
+                and not self._pending_order_exists(asset_id)
                 and self._cooldown_passed(asset_id, "buy", timestamp)
             ):
-                fee = approx_crypto_5m_taker_fee_per_share(book.best_ask) * self.paper_trade_shares
-                total_cost = book.best_ask * self.paper_trade_shares + fee
                 is_initial_trade = not self.initial_trade_taken
                 required_alpha = self.min_alpha_net
                 note = "positive ask alpha"
 
                 if is_initial_trade:
+                    if self._initial_trade_pending:
+                        continue
                     if seconds_since_start < self.initial_trade_wait_seconds:
                         continue
                     required_alpha = max(required_alpha, 0.1)
@@ -1641,80 +2234,45 @@ class LivePaperStrategy:
                 if snapshot["buy_alpha_net"] < required_alpha:
                     continue
 
-                market_exposure = self.current_market_exposure()
-                if self.cash >= total_cost and market_exposure + total_cost <= self.max_market_exposure_usd:
-                    self.cash -= total_cost
-                    self.market_buy_budget_used_usd += total_cost
-                    position.shares += self.paper_trade_shares
-                    position.cost_basis += total_cost
-                    self.trade_count += 1
-                    self._record_buy_alpha(snapshot["buy_alpha_net"])
-                    if is_initial_trade:
-                        self.initial_trade_taken = True
-                    self._last_trade_at[(asset_id, "buy")] = timestamp
-                    self._recent_events.append(
-                        f"BUY {book.label} {self.paper_trade_shares:.0f} @ {book.best_ask:.4f} | alpha {snapshot['buy_alpha_net']:+.4f}"
-                    )
-                    self.recorder.write_paper_trade(
-                        asset_id=asset_id,
-                        token_label=book.label,
-                        action="buy",
-                        shares=self.paper_trade_shares,
-                        price=book.best_ask,
-                        fee=fee,
-                        fair_value=snapshot["fair_value"],
-                        market_mid=snapshot["market_mid"],
-                        buy_alpha_net=snapshot["buy_alpha_net"],
-                        sell_alpha_net=snapshot["sell_alpha_net"],
-                        cash_balance=self.cash,
-                        realized_pnl=self.realized_pnl,
-                        position_shares=position.shares,
-                        position_average_cost=position.average_cost,
-                        note=note,
-                        recorded_at=timestamp,
-                    )
+                self._recent_events.append(
+                    f"QUEUE BUY {book.label} after 500ms | alpha {snapshot['buy_alpha_net']:+.4f}"
+                )
+                self._schedule_market_order(
+                    asset_id=asset_id,
+                    side="buy",
+                    timestamp=timestamp,
+                    snapshot=snapshot,
+                    note=note,
+                    is_initial_trade=is_initial_trade,
+                )
 
+            allow_partial_position = (
+                book.best_bid is not None
+                and book.best_bid > 0
+                and position.shares * book.best_bid < PAPER_TRADE_NOTIONAL_USD
+            )
+            sell_fill = fill_sell_for_notional(
+                book.bid_levels,
+                target_notional=PAPER_TRADE_NOTIONAL_USD,
+                max_shares=position.shares,
+                allow_partial_position=allow_partial_position,
+            )
             if (
                 snapshot["sell_alpha_net"] is not None
-                and book.best_bid is not None
+                and sell_fill is not None
                 and snapshot["sell_alpha_net"] >= self.min_alpha_net
-                and position.shares >= self.paper_trade_shares
+                and not self._pending_order_exists(asset_id)
                 and self._cooldown_passed(asset_id, "sell", timestamp)
             ):
-                fee = approx_crypto_5m_taker_fee_per_share(book.best_bid) * self.paper_trade_shares
-                proceeds = book.best_bid * self.paper_trade_shares - fee
-                cost_removed = position.average_cost * self.paper_trade_shares
-                realized = proceeds - cost_removed
-                self.cash += proceeds
-                self.realized_pnl += realized
-                position.shares -= self.paper_trade_shares
-                position.cost_basis -= cost_removed
-                self._record_closed_trade(self.paper_trade_shares, realized)
-                if position.shares <= 1e-9:
-                    position.shares = 0.0
-                    position.cost_basis = 0.0
-                self.trade_count += 1
-                self._last_trade_at[(asset_id, "sell")] = timestamp
                 self._recent_events.append(
-                    f"SELL {book.label} {self.paper_trade_shares:.0f} @ {book.best_bid:.4f} | realized {format_money(realized)}"
+                    f"QUEUE SELL {book.label} after 500ms | alpha {snapshot['sell_alpha_net']:+.4f}"
                 )
-                self.recorder.write_paper_trade(
+                self._schedule_market_order(
                     asset_id=asset_id,
-                    token_label=book.label,
-                    action="sell",
-                    shares=self.paper_trade_shares,
-                    price=book.best_bid,
-                    fee=fee,
-                    fair_value=snapshot["fair_value"],
-                    market_mid=snapshot["market_mid"],
-                    buy_alpha_net=snapshot["buy_alpha_net"],
-                    sell_alpha_net=snapshot["sell_alpha_net"],
-                    cash_balance=self.cash,
-                    realized_pnl=self.realized_pnl,
-                    position_shares=position.shares,
-                    position_average_cost=position.average_cost,
+                    side="sell",
+                    timestamp=timestamp,
+                    snapshot=snapshot,
                     note="positive bid alpha",
-                    recorded_at=timestamp,
                 )
 
     def _cooldown_passed(self, asset_id: str, side: str, timestamp: datetime) -> bool:
@@ -1926,6 +2484,7 @@ class CsvRecorder:
         position_average_cost: float,
         note: str,
         recorded_at: datetime,
+        raw_json: str = "",
     ) -> None:
         self._write_row(
             recorded_at_utc=recorded_at.isoformat(),
@@ -1946,6 +2505,7 @@ class CsvRecorder:
             position_shares=f"{position_shares:.4f}",
             position_average_cost=f"{position_average_cost:.6f}",
             note=note,
+            raw_json=raw_json,
         )
 
     def _write_levels(self, *, event_type: str, side: str, asset_id: str, levels: list[dict[str, Any]]) -> None:
@@ -2036,6 +2596,48 @@ class CsvRecorder:
         self._row_buffer.clear()
 
 
+def fetch_assumed_resolution(market: MarketWindow) -> OfficialResolution | None:
+    try:
+        event_payload = http_json(f"{GAMMA_API_BASE}/events/{market.event_id}", timeout=20)
+    except Exception as exc:  # noqa: BLE001
+        log(
+            f"Resolution lookup failed for {market.slug}: {exc}",
+            label="RESOLVE",
+            tone="yellow",
+        )
+        return None
+
+    poll_state = describe_resolution_poll(event_payload)
+    resolution = extract_official_resolution(event_payload)
+    if resolution is not None:
+        if resolution.price_to_beat is not None and resolution.final_price is not None:
+            log(
+                (
+                    f"Assumed resolution for {market.slug}: "
+                    f"{'Up' if resolution.up_wins else 'Down'} "
+                    f"({resolution.final_price:.4f} vs {resolution.price_to_beat:.4f}) | "
+                    f"{poll_state}"
+                ),
+                label="RESOLVE",
+                tone="green",
+            )
+        else:
+            log(
+                f"Assumed resolution for {market.slug}: "
+                f"{'Up' if resolution.up_wins else 'Down'} | {poll_state}",
+                label="RESOLVE",
+                tone="green",
+            )
+        return resolution
+
+    log(
+        f"Could not assume resolution for {market.slug}; falling back to local price comparison | {poll_state}",
+        label="RESOLVE",
+        tone="yellow",
+    )
+    return None
+
+
 async def stream_market(
     market: MarketWindow,
     recorder: CsvRecorder,
@@ -2049,6 +2651,19 @@ async def stream_market(
     reconnects = 0
     started_at = utc_now()
     session_deadline = market.window_end + timedelta(seconds=post_close_grace_seconds)
+    if strategy.start_underlying_price is None:
+        try:
+            seeded_reference = fetch_previous_market_reference(market)
+        except Exception as exc:  # noqa: BLE001
+            seeded_reference = None
+            log(
+                f"Previous market reference lookup failed for {market.slug}: {exc}",
+                label="REF",
+                tone="yellow",
+            )
+        if seeded_reference is not None:
+            reference_price, previous_slug = seeded_reference
+            strategy.seed_reference_price(reference_price, note=f"Polymarket {previous_slug} finalPrice")
     underlying_stop = asyncio.Event()
     underlying_task = asyncio.create_task(
         stream_underlying_quotes(
@@ -2130,10 +2745,16 @@ async def stream_market(
     finally:
         underlying_stop.set()
         await underlying_task
-        strategy.settle(timestamp=utc_now())
-        snapshot_status["value"] = "settled"
+        await strategy.cancel_pending_orders()
         dashboard_stop.set()
         await dashboard_task
+        log(
+            f"Trading window closed for {market.slug}. Returning to terminal log view.",
+            label="CLOSE",
+            tone="cyan",
+        )
+        strategy.settle(timestamp=utc_now(), official_resolution=fetch_assumed_resolution(market))
+        snapshot_status["value"] = "settled"
         snapshot_stop.set()
         await snapshot_task
 
@@ -2172,6 +2793,7 @@ async def run(args: argparse.Namespace) -> None:
     recorded_count = 0
     session_balance = args.starting_balance
     session_starting_balance = args.starting_balance
+    carry_forward_reference_price: float | None = None
     session_alpha_stats = SessionAlphaStats()
     session_performance_stats = SessionPerformanceStats()
     base_output_dir = Path(args.output_dir).expanduser().resolve()
@@ -2284,6 +2906,12 @@ async def run(args: argparse.Namespace) -> None:
             session_performance_stats=session_performance_stats,
             trade_cooldown_seconds=args.trade_cooldown_seconds,
         )
+        if carry_forward_reference_price is not None:
+            strategy.seed_reference_price(
+                carry_forward_reference_price,
+                note="previous market close",
+            )
+            carry_forward_reference_price = None
         if summary_output_path is not None:
             initial_summary_recorded_at = utc_now()
             upsert_market_summary_row(
@@ -2317,6 +2945,7 @@ async def run(args: argparse.Namespace) -> None:
         processed_market_ids.add(market.market_id)
         recorded_count += 1
         session_balance = strategy.current_balance()
+        carry_forward_reference_price = strategy.latest_underlying_price
         session_alpha_stats = session_alpha_stats.with_market(strategy.market_max_buy_alpha_net)
         session_performance_stats = session_performance_stats.with_market(strategy.current_market_performance())
         cycle_finished_at = utc_now()
