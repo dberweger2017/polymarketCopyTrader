@@ -1,0 +1,56 @@
+{
+  "generated_at_utc": "2026-04-17T11:17:57.720914+00:00",
+  "market": {
+    "question": "Ethereum Up or Down - April 17, 7:15AM-7:20AM ET",
+    "slug": "eth-updown-5m-1776424500",
+    "condition_id": "0x25e1d69f01bedaab954d6e077dac4cf5369c0efecedc185f3edcb99d2a634fe2",
+    "start_date_utc": "2026-04-17T11:15:00+00:00",
+    "end_date_utc": "2026-04-17T11:20:00+00:00",
+    "minimum_order_size": 5,
+    "minimum_tick_size": 0.01,
+    "tokens": [
+      {
+        "token_id": "23149699241400026121605394926372299183805766677906887406822305847606050455497",
+        "outcome": "Up",
+        "price": 0.515,
+        "winner": false
+      },
+      {
+        "token_id": "73967076623953272463405153027670320242232961525971698165211187518819789858410",
+        "outcome": "Down",
+        "price": 0.485,
+        "winner": false
+      }
+    ]
+  },
+  "decision_rule": "Buy the currently higher-priced outcome on the active 5-minute market.",
+  "chosen_outcome": {
+    "token_id": "23149699241400026121605394926372299183805766677906887406822305847606050455497",
+    "outcome": "Up",
+    "price": "0.515"
+  },
+  "pre_trade_snapshot": {
+    "captured_at_utc": "2026-04-17T11:17:57.720684+00:00",
+    "cash_balance_usdc": "50.635152",
+    "cash_balance_micro_usdc": "50635152",
+    "open_orders_count": 0,
+    "open_order_reserved_cash_usdc": "0",
+    "total_position_value_usdc": "0",
+    "free_cash_usdc": "50.635152",
+    "market_positions_count": 0,
+    "market_positions": []
+  },
+  "docs_notes": {
+    "balance_allowance_endpoint_tracks_cash_collateral": true,
+    "positions_should_be_queried_via_data_api_positions_or_value": true,
+    "user_channel_exists_for_faster_trade_lifecycle_updates": true,
+    "official_refs": [
+      "https://docs.polymarket.com/api-reference/authentication",
+      "https://docs.polymarket.com/market-data/websocket/user-channel",
+      "https://docs.polymarket.com/concepts/order-lifecycle",
+      "https://docs.polymarket.com/trading/orderbook",
+      "https://docs.polymarket.com/trading/orders/create"
+    ]
+  },
+  "live_execution": "skipped"
+}
