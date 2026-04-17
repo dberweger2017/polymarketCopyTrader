@@ -159,6 +159,89 @@ Use these rules:
 - CLOB `get_trades()`: same L2 client
 - live order placement: same L2 client, with orders signed by the private key
 
+## Cash vs Positions
+
+These values are separate and should not be mixed:
+
+- `get_balance_allowance()` returns cash collateral only.
+- Data API `/positions` returns the open positions.
+- Data API `/value` returns marked position value.
+- Open orders should be queried separately from CLOB orders.
+
+Practical interpretation:
+
+- cash available now: `get_balance_allowance()["balance"] / 1e6`
+- open positions: Data API `/positions` for the proxy wallet
+- marked portfolio value: Data API `/value` for the proxy wallet
+- open order reserve: derive from open buy orders or track it locally
+
+Important: `/value` is not the same thing as executable liquidation value. In the live probe, a position showed a much higher marked value while the immediate FAK exit found no matching liquidity.
+
+## Live Probe Findings
+
+The repo now contains a live test script at [scripts/polymarket_5m_live_probe.py](/Users/dberweger/Desktop/Code/polymarketCopyTrader/scripts/polymarket_5m_live_probe.py).
+
+What the live test confirmed:
+
+- the account can place live orders with `signature_type=1`
+- the bought position appears under Data API `/positions` for the proxy wallet
+- cash dropped immediately after the buy in `get_balance_allowance()`
+- open orders remained separate from both cash and positions
+- an attempted forced exit can fail even when `/value` marks the position materially above entry
+
+This means the safest account breakdown is:
+
+- cash: `get_balance_allowance()`
+- open orders: CLOB `get_orders()`
+- open positions: Data API `/positions`
+- marked position value: Data API `/value`
+- executable exit value: CLOB book or actual matched trades
+
+## Latency Measurement
+
+For latency work, polling is usable but not ideal. The faster path is:
+
+- submit the order through CLOB
+- listen on the user websocket for order and trade lifecycle events
+- optionally watch the orderbook websocket for book changes
+
+Useful checkpoints:
+
+- local decision timestamp right before `POST /order`
+- HTTP response timestamp
+- websocket `MATCHED` timestamp
+- websocket `CONFIRMED` or mined timestamp
+
+Relevant docs:
+
+- [Polymarket User WebSocket](https://docs.polymarket.com/market-data/websocket/user-channel)
+- [Polymarket Order Lifecycle](https://docs.polymarket.com/concepts/order-lifecycle)
+- [Polymarket Orderbook](https://docs.polymarket.com/trading/orderbook)
+
+## Market And Token Mapping
+
+For these short-duration binary markets, the most reliable way to map token IDs to the human outcome is `client.get_market(condition_id)`.
+
+That response exposes:
+
+- token IDs
+- outcome labels
+- current prices
+- `minimum_order_size`
+- `minimum_tick_size`
+
+Using `get_market()` avoids guessing which token corresponds to `Up` or `Down`.
+
+## Minimum Size Notes
+
+Current docs and live market metadata still surface `minimum_order_size = 5`.
+
+What was not confirmed as a current hard rule:
+
+- a strict minimum `$1` position value
+
+The live probe produced an open position with `initialValue = 0.9287`, so this account was able to hold a sub-$1 position value in practice. Document the 5-share minimum, but do not assume a hard `$1` minimum position value unless Polymarket documents it explicitly.
+
 ## Python Client Example
 
 ```python
@@ -204,5 +287,8 @@ For this account, the wrong configuration was `signature_type=2`. The correct co
 - [Polymarket Authentication](https://docs.polymarket.com/api-reference/authentication)
 - [Polymarket L2 Client Methods](https://docs.polymarket.com/trading/clients/l2)
 - [Polymarket Order Attribution](https://docs.polymarket.com/trading/orders/attribution)
+- [Polymarket Order Lifecycle](https://docs.polymarket.com/concepts/order-lifecycle)
+- [Polymarket User WebSocket](https://docs.polymarket.com/market-data/websocket/user-channel)
+- [Polymarket Orderbook](https://docs.polymarket.com/trading/orderbook)
 - [Polymarket Positions API](https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user)
 - [Polymarket User Position Value API](https://docs.polymarket.com/api-reference/core/get-total-value-of-a-users-positions)
