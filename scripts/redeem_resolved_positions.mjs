@@ -4,7 +4,10 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { RelayClient, RelayerTxType } from "../frontend/node_modules/@polymarket/builder-relayer-client/dist/index.js";
+import { buildProxyTransactionRequest } from "../frontend/node_modules/@polymarket/builder-relayer-client/dist/builder/proxy.js";
+import { getContractConfig, isProxyContractConfigValid } from "../frontend/node_modules/@polymarket/builder-relayer-client/dist/config/index.js";
+import { RelayClient, RelayerTxType, TransactionType, RelayerTransactionState } from "../frontend/node_modules/@polymarket/builder-relayer-client/dist/index.js";
+import { createAbstractSigner } from "../frontend/node_modules/@polymarket/builder-abstract-signer/dist/index.js";
 import { createWalletClient, encodeFunctionData, http, zeroHash } from "../frontend/node_modules/viem/_esm/index.js";
 import { privateKeyToAccount } from "../frontend/node_modules/viem/_esm/accounts/index.js";
 import { polygon } from "../frontend/node_modules/viem/_esm/chains/index.js";
@@ -74,6 +77,32 @@ function buildRedeemTransaction(conditionId) {
   };
 }
 
+async function submitWithRelayerApiKey({ request, env }) {
+  const response = await fetch(`${RELAYER_URL}/submit`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      RELAYER_API_KEY: env.POLYMARKET_RELAYER_API_KEY,
+      RELAYER_API_KEY_ADDRESS: env.POLYMARKET_RELAYER_API_KEY_ADDRESS,
+    },
+    body: JSON.stringify(request),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(`submit failed ${response.status} ${JSON.stringify(payload)}`);
+  }
+  return payload;
+}
+
+async function waitForTerminalState({ relayClient, transactionId }) {
+  return relayClient.pollUntilState(
+    transactionId,
+    [RelayerTransactionState.STATE_MINED, RelayerTransactionState.STATE_CONFIRMED],
+    RelayerTransactionState.STATE_FAILED,
+    100,
+  );
+}
+
 function loadRedeemTargets(repoRoot, envFile) {
   const output = execFileSync(
     resolve(repoRoot, ".venv/bin/python"),
@@ -135,14 +164,12 @@ async function main() {
     chain: polygon,
     transport: http(env.POLYGON_RPC_URL || "https://polygon-rpc.com"),
   });
-  const relayClient = new RelayClient({
-    host: RELAYER_URL,
-    chain: CHAIN_ID,
-    signer: wallet,
-    relayerApiKey: env.POLYMARKET_RELAYER_API_KEY,
-    relayerApiKeyAddress: env.POLYMARKET_RELAYER_API_KEY_ADDRESS,
-    txType: RelayerTxType.PROXY,
-  });
+  const relayClient = new RelayClient(RELAYER_URL, CHAIN_ID, wallet, undefined, RelayerTxType.PROXY);
+  const signer = createAbstractSigner(CHAIN_ID, wallet);
+  const proxyContractConfig = getContractConfig(CHAIN_ID).ProxyContracts;
+  if (!isProxyContractConfigValid(proxyContractConfig)) {
+    throw new Error("unsupported proxy contract config");
+  }
 
   const successes = [];
   const failures = [];
@@ -152,8 +179,24 @@ async function main() {
     const metadata = `Redeem ${target.slug}`;
     process.stdout.write(`Submitting ${target.slug}... `);
     try {
-      const response = await relayClient.execute([tx], metadata);
-      const result = await response.wait();
+      const relayPayload = await relayClient.getRelayPayload(account.address, TransactionType.PROXY);
+      const request = await buildProxyTransactionRequest(
+        signer,
+        {
+          from: account.address,
+          gasPrice: "0",
+          data: tx.data,
+          relay: relayPayload.address,
+          nonce: relayPayload.nonce,
+        },
+        proxyContractConfig,
+        metadata,
+      );
+      const submitResult = await submitWithRelayerApiKey({ request, env });
+      const result = await waitForTerminalState({
+        relayClient,
+        transactionId: submitResult.transactionID,
+      });
       if (!result?.transactionHash) {
         throw new Error("relayer returned no mined transaction hash");
       }
