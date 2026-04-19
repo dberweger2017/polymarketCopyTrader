@@ -10,13 +10,27 @@ import subprocess
 import sys
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+from polymarket_live import (
+    LiveDependencyError,
+    OrderType,
+    UserChannel,
+    build_auth_client,
+    build_live_account_state,
+    calculate_live_sell_shares,
+    ensure_live_dependencies,
+    execute_market_order,
+    fetch_live_account_state,
+    load_env as load_live_env,
+    wait_for_order_confirmation,
+)
 
 try:
     import pandas as pd
@@ -51,6 +65,8 @@ PAPER_TRADE_NOTIONAL_USD = 1.0
 MARKET_ORDER_EXECUTION_DELAY_SECONDS = 0.5
 MARKET_ORDER_TRACE_DELAYS_SECONDS = (0.0, 0.25, 0.5, 0.75)
 NO_NEW_TRADES_LAST_SECONDS = 5.0
+LIVE_ACCOUNT_REFRESH_SECONDS = 1.0
+LIVE_RESERVED_CASH_EPSILON_USDC = 1e-6
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -247,7 +263,7 @@ CONSOLE = Console()
 
 
 def utc_now() -> datetime:
-    return datetime.now(UTC)
+    return datetime.now(timezone.utc)
 
 
 def supports_color() -> bool:
@@ -283,7 +299,7 @@ def log(message: str, *, label: str = "INFO", tone: str = "white") -> None:
 
 
 def format_utc(value: datetime) -> str:
-    return value.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def format_duration(total_seconds: float) -> str:
@@ -440,6 +456,7 @@ def build_market_terminal_summary(
     cycle_text = f"Cycle #{cycle_number} " if cycle_number is not None else ""
     summary_text = (
         f"{cycle_text}{prefix} "
+        f"| Mode={strategy.execution_mode} "
         f"| Market={strategy.market.title} "
         f"| Time Left={format_duration(remaining)} "
         f"| balance={format_money(strategy.current_balance())} "
@@ -467,6 +484,21 @@ def build_market_terminal_summary(
         f"| Sigma/sqrt(s)={sigma_text} "
         f"| Fair Up={fair_up_text}"
     )
+    if strategy.uses_live_execution():
+        summary_text = (
+            f"{summary_text} "
+            f"| Marked Open={format_money(strategy.marked_open_value())} "
+            f"| Exec Open={format_money(strategy.executable_open_value())} "
+            f"| Reserved={format_money(strategy.open_order_reserved_cash())}"
+        )
+        if strategy.average_live_buy_match_ms() is not None:
+            summary_text = f"{summary_text} | Avg Buy Match ms={strategy.average_live_buy_match_ms():.1f}"
+        else:
+            summary_text = f"{summary_text} | Avg Buy Match ms=-"
+        if strategy.average_live_sell_match_ms() is not None:
+            summary_text = f"{summary_text} | Avg Sell Match ms={strategy.average_live_sell_match_ms():.1f}"
+        else:
+            summary_text = f"{summary_text} | Avg Sell Match ms=-"
     if stream_stats is not None:
         summary_text = (
             f"{summary_text} "
@@ -512,7 +544,11 @@ def build_market_summary_row(
         "time_left": format_duration(max((market.window_end - snapshot_time).total_seconds(), 0.0)),
         "balance": format_money(strategy.current_balance()),
         "cash": format_money(strategy.cash),
-        "open_value": format_money(strategy.current_liquidation_value()),
+        "open_value": (
+            format_money(strategy.executable_open_value())
+            if strategy.uses_live_execution()
+            else format_money(strategy.current_liquidation_value())
+        ),
         "exposure": f"{format_money(strategy.current_market_exposure())} / {format_money(strategy.max_market_exposure_usd)}",
         "lifetime_buys": f"{format_money(strategy.market_buy_budget_used_usd)} / {format_money(strategy.max_market_exposure_usd)}",
         "realized": format_money(strategy.realized_pnl),
@@ -627,7 +663,7 @@ def parse_iso_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC)
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
     except ValueError:
         return None
 
@@ -990,6 +1026,11 @@ def window_filename(market: MarketWindow) -> str:
     return f"{end_stamp}__{safe_slug(market.slug)}__{market.market_id}.csv"
 
 
+def session_filename(*, asset: str, execution_mode: str, started_at: datetime) -> str:
+    stamp = started_at.strftime("%Y%m%dT%H%M%SZ")
+    return f"{stamp}__{safe_slug(asset)}__{execution_mode}__session.csv"
+
+
 def resolve_underlying_config(asset: str, source: str) -> UnderlyingConfig:
     if source == "coinbase":
         return UNDERLYING_CONFIGS[asset]
@@ -1204,6 +1245,33 @@ def format_percent(value: float) -> str:
     return f"{value * 100:.1f}%"
 
 
+def live_state_is_flat(
+    state: dict[str, Any],
+    *,
+    reserved_cash_epsilon: float = LIVE_RESERVED_CASH_EPSILON_USDC,
+) -> bool:
+    return (
+        int(state.get("open_positions_count") or 0) == 0
+        and int(state.get("open_orders_count") or 0) == 0
+        and abs(float(state.get("open_order_reserved_cash_usdc") or 0.0)) <= reserved_cash_epsilon
+    )
+
+
+def describe_live_state_guard(state: dict[str, Any]) -> str:
+    details: list[str] = []
+    positions = state.get("positions", [])
+    if positions:
+        labels = ", ".join(f"{row['label']} {row['shares']}" for row in positions)
+        details.append(f"positions={labels}")
+    open_orders_count = int(state.get("open_orders_count") or 0)
+    if open_orders_count > 0:
+        details.append(f"open_orders={open_orders_count}")
+    reserved_cash = float(state.get("open_order_reserved_cash_usdc") or 0.0)
+    if abs(reserved_cash) > LIVE_RESERVED_CASH_EPSILON_USDC:
+        details.append(f"reserved_cash={reserved_cash:.6f}")
+    return ", ".join(details) or "flat"
+
+
 def sparkline(values: list[float], *, width: int) -> str:
     if width <= 0:
         return ""
@@ -1291,6 +1359,7 @@ class PaperPosition:
     label: str
     shares: float = 0.0
     cost_basis: float = 0.0
+    opened_at: datetime | None = None
 
     @property
     def average_cost(self) -> float:
@@ -1299,30 +1368,63 @@ class PaperPosition:
         return self.cost_basis / self.shares
 
 
+@dataclass
+class LiveLatencyStats:
+    buy_match_count: int = 0
+    buy_match_sum_ms: float = 0.0
+    sell_match_count: int = 0
+    sell_match_sum_ms: float = 0.0
+
+    @property
+    def average_buy_match_ms(self) -> float | None:
+        if self.buy_match_count <= 0:
+            return None
+        return self.buy_match_sum_ms / self.buy_match_count
+
+    @property
+    def average_sell_match_ms(self) -> float | None:
+        if self.sell_match_count <= 0:
+            return None
+        return self.sell_match_sum_ms / self.sell_match_count
+
+    def record(self, *, side: str, matched_ms: float) -> None:
+        if side == "BUY":
+            self.buy_match_count += 1
+            self.buy_match_sum_ms += matched_ms
+            return
+        self.sell_match_count += 1
+        self.sell_match_sum_ms += matched_ms
+
+
 class LivePaperStrategy:
     def __init__(
         self,
         market: MarketWindow,
         recorder: CsvRecorder,
         *,
+        execution_mode: str,
         starting_balance: float,
         session_starting_balance: float,
         paper_trade_shares: float,
+        live_buy_notional_usd: float,
         min_alpha_net: float,
         max_position_shares: float,
         max_market_exposure_usd: float,
         historical_average_max_alpha: float | None,
         session_performance_stats: SessionPerformanceStats,
         trade_cooldown_seconds: float,
+        env_file: str | None = None,
         initial_trade_wait_seconds: float = 30.0,
         history_points: int | None = None,
     ) -> None:
         self.market = market
         self.recorder = recorder
+        self.execution_mode = execution_mode
         self.starting_balance = starting_balance
         self.session_starting_balance = session_starting_balance
         self.cash = starting_balance
         self.paper_trade_shares = paper_trade_shares
+        self.live_buy_notional_usd = live_buy_notional_usd
         self.min_alpha_net = min_alpha_net
         self.max_position_shares = max_position_shares
         self.max_market_exposure_usd = max_market_exposure_usd
@@ -1358,6 +1460,20 @@ class LivePaperStrategy:
         self.latest_underlying_price: float | None = None
         self.latest_underlying_timestamp: datetime | None = None
         self.start_underlying_price: float | None = None
+        self._live_state: dict[str, Any] = build_live_account_state(
+            cash_balance_micro_usdc="0",
+            open_orders=[],
+            positions=[],
+        )
+        self._live_state_stop: asyncio.Event | None = None
+        self._live_state_task: asyncio.Task[None] | None = None
+        self._live_confirmation_tasks: set[asyncio.Task[None]] = set()
+        self._live_env = load_live_env(Path(env_file)) if self.execution_mode == "live" and env_file is not None else None
+        self._live_client: Any | None = None
+        self._live_user_channel: UserChannel | None = None
+        self._live_proxy_address = ""
+        self._live_last_order_summary: dict[str, Any] | None = None
+        self._live_latency_stats = LiveLatencyStats()
         self._books = {
             asset_id: BookState(asset_id=asset_id, label=label)
             for asset_id, label in zip(self.market.token_ids, self.market.outcome_labels, strict=True)
@@ -1366,6 +1482,12 @@ class LivePaperStrategy:
             asset_id: PaperPosition(asset_id=asset_id, label=label)
             for asset_id, label in zip(self.market.token_ids, self.market.outcome_labels, strict=True)
         }
+        if self.execution_mode == "live":
+            ensure_live_dependencies()
+            if self._live_env is None:
+                raise SystemExit("Live mode requires --env-file with Polymarket credentials.")
+            self._live_client = build_auth_client(self._live_env)
+            self._live_proxy_address = self._live_env["POLYMARKET_PROXY_ADDRESS"]
 
     @property
     def up_asset_id(self) -> str:
@@ -1380,6 +1502,243 @@ class LivePaperStrategy:
             if label.lower() == "down":
                 return asset_id
         return self.market.token_ids[1]
+
+    def uses_live_execution(self) -> bool:
+        return self.execution_mode == "live"
+
+    def trade_notional_usd(self) -> float:
+        if self.uses_live_execution():
+            return self.live_buy_notional_usd
+        return PAPER_TRADE_NOTIONAL_USD
+
+    def _current_queue_delay_seconds(self) -> float:
+        if self.uses_live_execution():
+            return 0.0
+        return MARKET_ORDER_EXECUTION_DELAY_SECONDS
+
+    def _live_position_row(self, asset_id: str) -> dict[str, Any] | None:
+        return self._live_state.get("positions_by_asset", {}).get(asset_id)
+
+    def _live_marked_price(self, asset_id: str) -> float:
+        row = self._live_position_row(asset_id)
+        if row is not None:
+            marked_price = float_or_none(row.get("marked_price"))
+            if marked_price is not None and marked_price > 0:
+                return marked_price
+        book = self._books[asset_id]
+        if book.mid is not None:
+            return book.mid
+        return 0.0
+
+    def _live_executable_price(self, asset_id: str) -> float:
+        row = self._live_position_row(asset_id)
+        if row is not None:
+            executable_sell_price = float_or_none(row.get("executable_sell_price"))
+            if executable_sell_price is not None and executable_sell_price > 0:
+                return executable_sell_price
+        book = self._books[asset_id]
+        if book.best_bid is not None:
+            return book.best_bid
+        return 0.0
+
+    def position_shares(self, asset_id: str) -> float:
+        return self._positions[asset_id].shares
+
+    def position_average_cost(self, asset_id: str) -> float:
+        return self._positions[asset_id].average_cost
+
+    def position_cost_basis(self, asset_id: str) -> float:
+        return self._positions[asset_id].cost_basis
+
+    def marked_open_value(self) -> float:
+        if not self.uses_live_execution():
+            return self.current_balance() - self.cash
+        return sum(
+            position.shares * self._live_marked_price(asset_id)
+            for asset_id, position in self._positions.items()
+            if position.shares > 0
+        )
+
+    def executable_open_value(self) -> float:
+        if not self.uses_live_execution():
+            return self.current_liquidation_value()
+        return sum(
+            position.shares * self._live_executable_price(asset_id)
+            for asset_id, position in self._positions.items()
+            if position.shares > 0
+        )
+
+    def marked_total_account_value(self) -> float:
+        if not self.uses_live_execution():
+            return self.current_balance()
+        return float(self._live_state.get("marked_total_account_value_usdc") or 0.0)
+
+    def executable_total_account_value(self) -> float:
+        if not self.uses_live_execution():
+            return self.current_balance()
+        return float(self._live_state.get("executable_total_account_value_usdc") or 0.0)
+
+    def open_order_reserved_cash(self) -> float:
+        if not self.uses_live_execution():
+            return 0.0
+        return float(self._live_state.get("open_order_reserved_cash_usdc") or 0.0)
+
+    def average_live_buy_match_ms(self) -> float | None:
+        return self._live_latency_stats.average_buy_match_ms
+
+    def average_live_sell_match_ms(self) -> float | None:
+        return self._live_latency_stats.average_sell_match_ms
+
+    def last_live_order_status(self) -> str:
+        if self._live_last_order_summary is None:
+            return "-"
+        status = self._live_last_order_summary.get("status") or "-"
+        side = self._live_last_order_summary.get("side") or ""
+        return f"{side} {status}".strip()
+
+    def live_account_is_flat(self) -> bool:
+        if not self.uses_live_execution():
+            return all(position.shares <= 1e-9 for position in self._positions.values())
+        return live_state_is_flat(self._live_state)
+
+    async def start_runtime(self) -> None:
+        if not self.uses_live_execution():
+            return
+        assert self._live_env is not None
+        self._live_user_channel = await UserChannel(
+            self._live_env["POLYMARKET_API_KEY"],
+            self._live_env["POLYMARKET_API_SECRET"],
+            self._live_env["POLYMARKET_API_PASSPHRASE"],
+            self.market.condition_id,
+        ).__aenter__()
+        await self.refresh_live_state(force=True)
+        self._live_state_stop = asyncio.Event()
+        self._live_state_task = asyncio.create_task(self._live_state_loop())
+
+    async def stop_runtime(self) -> None:
+        if not self.uses_live_execution():
+            return
+        if self._live_state_stop is not None:
+            self._live_state_stop.set()
+        if self._live_state_task is not None:
+            await self._live_state_task
+            self._live_state_task = None
+        if self._live_confirmation_tasks:
+            for task in list(self._live_confirmation_tasks):
+                task.cancel()
+            await asyncio.gather(*self._live_confirmation_tasks, return_exceptions=True)
+            self._live_confirmation_tasks.clear()
+        if self._live_user_channel is not None:
+            await self._live_user_channel.__aexit__(None, None, None)
+            self._live_user_channel = None
+
+    async def _live_state_loop(self) -> None:
+        assert self._live_state_stop is not None
+        while not self._live_state_stop.is_set():
+            try:
+                await self.refresh_live_state(force=True)
+            except Exception as exc:  # noqa: BLE001
+                self._recent_events.append(f"Live state refresh failed: {exc}")
+            try:
+                await asyncio.wait_for(self._live_state_stop.wait(), timeout=LIVE_ACCOUNT_REFRESH_SECONDS)
+            except TimeoutError:
+                continue
+
+    def _build_live_executable_price_overrides(self) -> dict[str, float | None]:
+        overrides: dict[str, float | None] = {}
+        for asset_id, book in self._books.items():
+            overrides[asset_id] = book.best_bid
+        return overrides
+
+    async def refresh_live_state(self, *, force: bool = False) -> None:
+        if not self.uses_live_execution():
+            return
+        assert self._live_client is not None
+        state = await asyncio.to_thread(
+            fetch_live_account_state,
+            self._live_client,
+            self._live_proxy_address,
+            executable_sell_prices=self._build_live_executable_price_overrides(),
+        )
+        self.apply_live_state(state)
+
+    def apply_live_state(self, state: dict[str, Any]) -> None:
+        self._live_state = state
+        self.cash = float(state["cash_balance_usdc"])
+
+    def live_guard_note(self) -> str:
+        if not self.uses_live_execution():
+            return ""
+        return describe_live_state_guard(self._live_state)
+
+    def _holding_time_seconds(self, asset_id: str, execution_timestamp: datetime) -> float | None:
+        opened_at = self._positions[asset_id].opened_at
+        if opened_at is None:
+            return None
+        return max((execution_timestamp - opened_at).total_seconds(), 0.0)
+
+    def _trade_trigger_alpha(self, side: str, decision_snapshot: dict[str, float | None]) -> float | None:
+        if side == "buy":
+            return decision_snapshot.get("buy_alpha_net")
+        return decision_snapshot.get("sell_alpha_net")
+
+    def _trade_log_context(
+        self,
+        *,
+        side: str,
+        decision_timestamp: datetime,
+        execution_timestamp: datetime,
+        decision_snapshot: dict[str, float | None],
+        desired_price: float | None,
+        actual_price: float | None,
+        execution_delay_ms: float | None,
+        entry_type: str | None = None,
+        holding_time_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        trigger_alpha = self._trade_trigger_alpha(side, decision_snapshot)
+        time_left_seconds = max((self.market.window_end - execution_timestamp).total_seconds(), 0.0)
+        sigma = self.sigma_per_sqrt_second()
+        fair_up = self.fair_up_probability(execution_timestamp)
+        return {
+            "desired_price": desired_price,
+            "actual_price": actual_price,
+            "trigger_alpha": trigger_alpha,
+            "fair_value_at_decision": decision_snapshot.get("fair_value"),
+            "best_bid_at_decision": decision_snapshot.get("decision_best_bid"),
+            "best_ask_at_decision": decision_snapshot.get("decision_best_ask"),
+            "underlying_price_to_beat": self.start_underlying_price,
+            "underlying_price_actual": self.latest_underlying_price,
+            "time_left_seconds": time_left_seconds,
+            "seconds_to_expiry": time_left_seconds,
+            "sigma_per_sqrt_s": sigma,
+            "fair_up": fair_up,
+            "execution_time_utc": execution_timestamp.isoformat(),
+            "matched_time_utc": execution_timestamp.isoformat(),
+            "trade_number_in_market": self.trade_count,
+            "execution_delay_ms": execution_delay_ms,
+            "cash_balance": self.cash,
+            "account_value": self.current_balance(),
+            "decision_time_utc": decision_timestamp.isoformat(),
+            "side": side,
+            "entry_type": entry_type,
+            "holding_time_seconds": holding_time_seconds,
+        }
+
+    def _compose_trade_raw_json(
+        self,
+        *,
+        trade_log_context: dict[str, Any],
+        execution_trace: str | dict[str, Any],
+    ) -> str:
+        payload: dict[str, Any] = {"trade_log": trade_log_context}
+        if isinstance(execution_trace, str):
+            try:
+                payload["execution_trace"] = json.loads(execution_trace)
+            except json.JSONDecodeError:
+                payload["execution_trace"] = execution_trace
+        else:
+            payload["execution_trace"] = execution_trace
+        return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
     def _pending_order_exists(self, asset_id: str) -> bool:
         task = self._pending_order_tasks.get(asset_id)
@@ -1432,7 +1791,7 @@ class LivePaperStrategy:
     ) -> None:
         if self._pending_order_exists(asset_id):
             return
-        if timestamp + timedelta(seconds=MARKET_ORDER_TRACE_DELAYS_SECONDS[-1]) >= self.market.window_end:
+        if timestamp + timedelta(seconds=self._current_queue_delay_seconds()) >= self.market.window_end:
             return
         if is_initial_trade and self._initial_trade_pending:
             return
@@ -1440,16 +1799,28 @@ class LivePaperStrategy:
         if is_initial_trade:
             self._initial_trade_pending = True
 
-        task = asyncio.create_task(
-            self._execute_delayed_market_order(
-                asset_id=asset_id,
-                side=side,
-                decision_timestamp=timestamp,
-                decision_snapshot=snapshot,
-                note=note,
-                is_initial_trade=is_initial_trade,
+        if self.uses_live_execution():
+            task = asyncio.create_task(
+                self._execute_live_market_order(
+                    asset_id=asset_id,
+                    side=side,
+                    decision_timestamp=timestamp,
+                    decision_snapshot=snapshot,
+                    note=note,
+                    is_initial_trade=is_initial_trade,
+                )
             )
-        )
+        else:
+            task = asyncio.create_task(
+                self._execute_delayed_market_order(
+                    asset_id=asset_id,
+                    side=side,
+                    decision_timestamp=timestamp,
+                    decision_snapshot=snapshot,
+                    note=note,
+                    is_initial_trade=is_initial_trade,
+                )
+            )
         self._pending_order_tasks[asset_id] = task
 
         def _cleanup(completed: asyncio.Task[None], *, key: str = asset_id, initial: bool = is_initial_trade) -> None:
@@ -1547,16 +1918,34 @@ class LivePaperStrategy:
             self._recent_events.append(f"BUY {book.label} aborted after 500ms: balance/exposure limit hit")
             return
 
+        was_flat = position.shares <= 1e-9
         average_buy_price = buy_notional / buy_shares
         self.cash -= total_cost
         self.market_buy_budget_used_usd += total_cost
         position.shares += buy_shares
         position.cost_basis += total_cost
+        if was_flat:
+            position.opened_at = utc_now()
         self.trade_count += 1
         self._record_buy_alpha(decision_snapshot["buy_alpha_net"])
         if is_initial_trade:
             self.initial_trade_taken = True
-        self._last_trade_at[(asset_id, "buy")] = utc_now()
+        recorded_at = utc_now()
+        if was_flat:
+            position.opened_at = recorded_at
+        self._last_trade_at[(asset_id, "buy")] = recorded_at
+        desired_price = float_or_none(samples[0].get("side_price")) if samples else None
+        execution_delay_ms = max((recorded_at - decision_timestamp).total_seconds() * 1000.0, 0.0)
+        trade_log_context = self._trade_log_context(
+            side="buy",
+            decision_timestamp=decision_timestamp,
+            execution_timestamp=recorded_at,
+            decision_snapshot=decision_snapshot,
+            desired_price=desired_price,
+            actual_price=average_buy_price,
+            execution_delay_ms=execution_delay_ms,
+            entry_type="first_entry" if was_flat else "later_add",
+        )
         self._recent_events.append(
             f"BUY {book.label} {buy_shares:.4f} for {format_money(buy_notional)} @ {average_buy_price:.4f} after 500ms"
         )
@@ -1576,18 +1965,41 @@ class LivePaperStrategy:
             position_shares=position.shares,
             position_average_cost=position.average_cost,
             note=note,
-            recorded_at=utc_now(),
-            raw_json=self._build_market_order_trace_payload(
-                asset_id=asset_id,
-                side="buy",
-                decision_timestamp=decision_timestamp,
-                decision_snapshot=decision_snapshot,
-                samples=samples,
-                status="filled",
-                executed_shares=buy_shares,
-                executed_price=average_buy_price,
-                fee=fee,
-                proceeds_or_notional=buy_notional,
+            recorded_at=recorded_at,
+            decision_time_utc=str(trade_log_context["decision_time_utc"]),
+            matched_time_utc=str(trade_log_context["matched_time_utc"]),
+            seconds_to_expiry=trade_log_context["seconds_to_expiry"],
+            fair_value_at_decision=trade_log_context["fair_value_at_decision"],
+            best_bid_at_decision=trade_log_context["best_bid_at_decision"],
+            best_ask_at_decision=trade_log_context["best_ask_at_decision"],
+            alpha_at_decision=trade_log_context["trigger_alpha"],
+            entry_type=str(trade_log_context["entry_type"] or ""),
+            desired_price=desired_price,
+            actual_price=average_buy_price,
+            trigger_alpha=trade_log_context["trigger_alpha"],
+            underlying_price_to_beat=trade_log_context["underlying_price_to_beat"],
+            underlying_price_actual=trade_log_context["underlying_price_actual"],
+            time_left_seconds=trade_log_context["time_left_seconds"],
+            sigma_per_sqrt_s=trade_log_context["sigma_per_sqrt_s"],
+            fair_up=trade_log_context["fair_up"],
+            execution_time_utc=str(trade_log_context["execution_time_utc"]),
+            trade_number_in_market=int(trade_log_context["trade_number_in_market"]),
+            execution_delay_ms=trade_log_context["execution_delay_ms"],
+            account_value=float(trade_log_context["account_value"]),
+            raw_json=self._compose_trade_raw_json(
+                trade_log_context=trade_log_context,
+                execution_trace=self._build_market_order_trace_payload(
+                    asset_id=asset_id,
+                    side="buy",
+                    decision_timestamp=decision_timestamp,
+                    decision_snapshot=decision_snapshot,
+                    samples=samples,
+                    status="filled",
+                    executed_shares=buy_shares,
+                    executed_price=average_buy_price,
+                    fee=fee,
+                    proceeds_or_notional=buy_notional,
+                ),
             ),
         )
 
@@ -1625,6 +2037,7 @@ class LivePaperStrategy:
         average_sell_price = (proceeds + fee) / sell_shares
         cost_removed = position.average_cost * sell_shares
         realized = proceeds - cost_removed
+        holding_time_seconds = self._holding_time_seconds(asset_id, utc_now())
         self.cash += proceeds
         self.realized_pnl += realized
         position.shares -= sell_shares
@@ -1633,8 +2046,22 @@ class LivePaperStrategy:
         if position.shares <= 1e-9:
             position.shares = 0.0
             position.cost_basis = 0.0
+            position.opened_at = None
         self.trade_count += 1
-        self._last_trade_at[(asset_id, "sell")] = utc_now()
+        recorded_at = utc_now()
+        self._last_trade_at[(asset_id, "sell")] = recorded_at
+        desired_price = float_or_none(samples[0].get("side_price")) if samples else None
+        execution_delay_ms = max((recorded_at - decision_timestamp).total_seconds() * 1000.0, 0.0)
+        trade_log_context = self._trade_log_context(
+            side="sell",
+            decision_timestamp=decision_timestamp,
+            execution_timestamp=recorded_at,
+            decision_snapshot=decision_snapshot,
+            desired_price=desired_price,
+            actual_price=average_sell_price,
+            execution_delay_ms=execution_delay_ms,
+            holding_time_seconds=holding_time_seconds,
+        )
         self._recent_events.append(
             f"SELL {book.label} {sell_shares:.4f} for {format_money(proceeds + fee)} @ {average_sell_price:.4f} after 500ms"
         )
@@ -1654,19 +2081,287 @@ class LivePaperStrategy:
             position_shares=position.shares,
             position_average_cost=position.average_cost,
             note="positive bid alpha",
-            recorded_at=utc_now(),
-            raw_json=self._build_market_order_trace_payload(
-                asset_id=asset_id,
-                side="sell",
-                decision_timestamp=decision_timestamp,
-                decision_snapshot=decision_snapshot,
-                samples=samples,
-                status="filled",
-                executed_shares=sell_shares,
-                executed_price=average_sell_price,
-                fee=fee,
-                proceeds_or_notional=proceeds + fee,
+            recorded_at=recorded_at,
+            decision_time_utc=str(trade_log_context["decision_time_utc"]),
+            matched_time_utc=str(trade_log_context["matched_time_utc"]),
+            seconds_to_expiry=trade_log_context["seconds_to_expiry"],
+            fair_value_at_decision=trade_log_context["fair_value_at_decision"],
+            best_bid_at_decision=trade_log_context["best_bid_at_decision"],
+            best_ask_at_decision=trade_log_context["best_ask_at_decision"],
+            alpha_at_decision=trade_log_context["trigger_alpha"],
+            realized_pnl_on_close=realized,
+            holding_time_seconds=trade_log_context["holding_time_seconds"],
+            desired_price=desired_price,
+            actual_price=average_sell_price,
+            trigger_alpha=trade_log_context["trigger_alpha"],
+            underlying_price_to_beat=trade_log_context["underlying_price_to_beat"],
+            underlying_price_actual=trade_log_context["underlying_price_actual"],
+            time_left_seconds=trade_log_context["time_left_seconds"],
+            sigma_per_sqrt_s=trade_log_context["sigma_per_sqrt_s"],
+            fair_up=trade_log_context["fair_up"],
+            execution_time_utc=str(trade_log_context["execution_time_utc"]),
+            trade_number_in_market=int(trade_log_context["trade_number_in_market"]),
+            execution_delay_ms=trade_log_context["execution_delay_ms"],
+            account_value=float(trade_log_context["account_value"]),
+            raw_json=self._compose_trade_raw_json(
+                trade_log_context=trade_log_context,
+                execution_trace=self._build_market_order_trace_payload(
+                    asset_id=asset_id,
+                    side="sell",
+                    decision_timestamp=decision_timestamp,
+                    decision_snapshot=decision_snapshot,
+                    samples=samples,
+                    status="filled",
+                    executed_shares=sell_shares,
+                    executed_price=average_sell_price,
+                    fee=fee,
+                    proceeds_or_notional=proceeds + fee,
+                ),
             ),
+        )
+
+    async def _execute_live_market_order(
+        self,
+        *,
+        asset_id: str,
+        side: str,
+        decision_timestamp: datetime,
+        decision_snapshot: dict[str, float | None],
+        note: str,
+        is_initial_trade: bool,
+    ) -> None:
+        if (self.market.window_end - utc_now()).total_seconds() <= NO_NEW_TRADES_LAST_SECONDS:
+            self._recent_events.append(
+                f"{side.upper()} {self._books[asset_id].label} canceled immediately: market is inside final {NO_NEW_TRADES_LAST_SECONDS:.0f}s"
+            )
+            return
+
+        assert self._live_client is not None
+        quote_side = "BUY" if side == "buy" else "SELL"
+        quote_payload = await asyncio.to_thread(self._live_client.get_price, asset_id, quote_side)
+        quote_price = Decimal(str(quote_payload["price"]))
+        if quote_price <= 0:
+            self._recent_events.append(f"{side.upper()} {self._books[asset_id].label} aborted: no executable quote")
+            return
+
+        if side == "buy":
+            requested_amount = Decimal(str(self.live_buy_notional_usd))
+            estimated_shares = float(requested_amount / quote_price) if quote_price > 0 else 0.0
+            estimated_fee = approx_crypto_5m_taker_fee_per_share(float(quote_price)) * estimated_shares
+            estimated_total_cost = float(requested_amount) + estimated_fee
+            if self.cash < float(requested_amount):
+                self._recent_events.append(f"BUY {self._books[asset_id].label} aborted: insufficient live cash")
+                return
+            if self.current_market_exposure() + estimated_total_cost > self.max_market_exposure_usd:
+                self._recent_events.append(f"BUY {self._books[asset_id].label} aborted: live exposure limit hit")
+                return
+        else:
+            available_shares = Decimal(str(self.position_shares(asset_id)))
+            requested_amount = calculate_live_sell_shares(
+                Decimal(str(self.live_buy_notional_usd)),
+                quote_price,
+                available_shares,
+            )
+            if requested_amount <= 0:
+                self._recent_events.append(f"SELL {self._books[asset_id].label} aborted: no live position to sell")
+                return
+
+        result = await execute_market_order(
+            client=self._live_client,
+            stream=self._live_user_channel,
+            condition_id=self.market.condition_id,
+            token_id=asset_id,
+            side=side.upper(),
+            amount=requested_amount,
+            order_type=OrderType.FAK,
+            current_price=quote_price,
+            tick_size=Decimal("0.01"),
+        )
+        matched_event = result["matched_event"]
+        matched_shares = float(matched_event.get("size") or 0.0)
+        matched_price = float(matched_event.get("price") or 0.0)
+        fee = approx_crypto_5m_taker_fee_per_share(matched_price) * matched_shares if matched_price > 0 else 0.0
+        gross_notional = matched_shares * matched_price
+        decision_to_matched_ms = float(result["decision_to_trade_matched_ms"])
+        self._live_latency_stats.record(side=side.upper(), matched_ms=decision_to_matched_ms)
+        self.trade_count += 1
+        execution_timestamp = parse_iso_datetime(str(matched_event.get("received_at_utc") or "")) or utc_now()
+
+        if side == "buy":
+            total_cost = gross_notional + fee
+            position = self._positions[asset_id]
+            was_flat = position.shares <= 1e-9
+            position.shares += matched_shares
+            position.cost_basis += total_cost
+            if was_flat:
+                position.opened_at = execution_timestamp
+            self.market_buy_budget_used_usd += total_cost
+            self._record_buy_alpha(decision_snapshot["buy_alpha_net"])
+            if is_initial_trade:
+                self.initial_trade_taken = True
+            note_text = note
+            realized_delta = None
+            proceeds_or_notional = gross_notional
+            entry_type = "first_entry" if was_flat else "later_add"
+            holding_time_seconds = None
+        else:
+            position = self._positions[asset_id]
+            holding_time_seconds = self._holding_time_seconds(asset_id, execution_timestamp)
+            cost_removed = min(position.average_cost * matched_shares, position.cost_basis)
+            proceeds_or_notional = max(gross_notional - fee, 0.0)
+            realized_delta = proceeds_or_notional - cost_removed
+            self.realized_pnl += realized_delta
+            position.shares = max(position.shares - matched_shares, 0.0)
+            position.cost_basis = max(position.cost_basis - cost_removed, 0.0)
+            if position.shares <= 1e-9:
+                position.shares = 0.0
+                position.cost_basis = 0.0
+                position.opened_at = None
+            self._record_closed_trade(matched_shares, realized_delta)
+            note_text = "positive bid alpha"
+            entry_type = ""
+
+        self._last_trade_at[(asset_id, side)] = execution_timestamp
+        self._recent_events.append(
+            f"{side.upper()} {self._books[asset_id].label} matched in {decision_to_matched_ms:.1f}ms @ {matched_price:.4f}"
+        )
+        self._live_last_order_summary = {
+            "side": side.upper(),
+            "status": "MATCHED",
+            "order_id": result["order_id"],
+            "decision_to_matched_ms": decision_to_matched_ms,
+            "decision_to_http_response_ms": result["decision_to_http_response_ms"],
+            "response_status": result["response_status"],
+        }
+        await self.refresh_live_state(force=True)
+        trade_log_context = self._trade_log_context(
+            side=side,
+            decision_timestamp=decision_timestamp,
+            execution_timestamp=execution_timestamp,
+            decision_snapshot=decision_snapshot,
+            desired_price=float(quote_price),
+            actual_price=matched_price,
+            execution_delay_ms=decision_to_matched_ms,
+            entry_type=entry_type,
+            holding_time_seconds=holding_time_seconds,
+        )
+        self.recorder.write_live_trade(
+            asset_id=asset_id,
+            token_label=self._books[asset_id].label,
+            action=side,
+            requested_amount=float(result["requested_amount"]),
+            filled_shares=matched_shares,
+            matched_price=matched_price,
+            fee=fee,
+            fair_value=decision_snapshot["fair_value"],
+            market_mid=decision_snapshot["market_mid"],
+            buy_alpha_net=decision_snapshot["buy_alpha_net"],
+            sell_alpha_net=decision_snapshot["sell_alpha_net"],
+            cash_balance=self.cash,
+            realized_pnl=self.realized_pnl,
+            position_shares=self.position_shares(asset_id),
+            position_average_cost=self.position_average_cost(asset_id),
+            response_status=result["response_status"],
+            order_id=result["order_id"],
+            http_submit_latency_ms=result["http_submit_latency_ms"],
+            decision_to_http_response_ms=result["decision_to_http_response_ms"],
+            decision_to_matched_ms=decision_to_matched_ms,
+            decision_to_confirmed_ms=None,
+            note=note_text,
+            recorded_at=execution_timestamp,
+            decision_time_utc=str(trade_log_context["decision_time_utc"]),
+            matched_time_utc=str(trade_log_context["matched_time_utc"]),
+            seconds_to_expiry=trade_log_context["seconds_to_expiry"],
+            fair_value_at_decision=trade_log_context["fair_value_at_decision"],
+            best_bid_at_decision=trade_log_context["best_bid_at_decision"],
+            best_ask_at_decision=trade_log_context["best_ask_at_decision"],
+            alpha_at_decision=trade_log_context["trigger_alpha"],
+            realized_pnl_on_close=realized_delta,
+            holding_time_seconds=trade_log_context["holding_time_seconds"],
+            entry_type=str(trade_log_context["entry_type"] or ""),
+            desired_price=float(quote_price),
+            actual_price=matched_price,
+            trigger_alpha=trade_log_context["trigger_alpha"],
+            underlying_price_to_beat=trade_log_context["underlying_price_to_beat"],
+            underlying_price_actual=trade_log_context["underlying_price_actual"],
+            time_left_seconds=trade_log_context["time_left_seconds"],
+            sigma_per_sqrt_s=trade_log_context["sigma_per_sqrt_s"],
+            fair_up=trade_log_context["fair_up"],
+            execution_time_utc=str(trade_log_context["execution_time_utc"]),
+            trade_number_in_market=int(trade_log_context["trade_number_in_market"]),
+            execution_delay_ms=trade_log_context["execution_delay_ms"],
+            account_value=float(trade_log_context["account_value"]),
+            raw_json=self._compose_trade_raw_json(
+                trade_log_context=trade_log_context,
+                execution_trace=result,
+            ),
+        )
+        self._spawn_live_confirmation_watch(
+            asset_id=asset_id,
+            side=side.upper(),
+            order_id=result["order_id"],
+            decision_monotonic_ns=int(result["decision_monotonic_ns"]),
+        )
+
+    def _spawn_live_confirmation_watch(
+        self,
+        *,
+        asset_id: str,
+        side: str,
+        order_id: str,
+        decision_monotonic_ns: int,
+    ) -> None:
+        task = asyncio.create_task(
+            self._watch_live_confirmation(
+                asset_id=asset_id,
+                side=side,
+                order_id=order_id,
+                decision_monotonic_ns=decision_monotonic_ns,
+            )
+        )
+        self._live_confirmation_tasks.add(task)
+
+        def _cleanup(done: asyncio.Task[None]) -> None:
+            self._live_confirmation_tasks.discard(done)
+
+        task.add_done_callback(_cleanup)
+
+    async def _watch_live_confirmation(
+        self,
+        *,
+        asset_id: str,
+        side: str,
+        order_id: str,
+        decision_monotonic_ns: int,
+    ) -> None:
+        try:
+            assert self._live_client is not None
+            confirmation = await wait_for_order_confirmation(
+                stream=self._live_user_channel,
+                client=self._live_client,
+                condition_id=self.market.condition_id,
+                order_id=order_id,
+                decision_monotonic_ns=decision_monotonic_ns,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._recent_events.append(f"{side} confirmation for {asset_id[-6:]} pending: {exc}")
+            return
+
+        self._live_last_order_summary = {
+            "side": side,
+            "status": "CONFIRMED",
+            "order_id": order_id,
+            "decision_to_confirmed_ms": confirmation["decision_to_trade_confirmed_ms"],
+        }
+        self.recorder.write_session_row(
+            "live_trade_confirmation",
+            {
+                "asset_id": asset_id,
+                "order_id": order_id,
+                "side": side,
+                "decision_to_confirmed_ms": confirmation["decision_to_trade_confirmed_ms"],
+                "confirmed_event": confirmation["confirmed_event"],
+            },
         )
 
     async def cancel_pending_orders(self) -> None:
@@ -1780,19 +2475,27 @@ class LivePaperStrategy:
         }
 
     def current_balance(self) -> float:
+        if self.uses_live_execution():
+            return self.marked_total_account_value()
         return self.cash + self.current_liquidation_value()
 
     def current_liquidation_value(self) -> float:
+        if self.uses_live_execution():
+            return self.executable_open_value()
         now = self.latest_underlying_timestamp or utc_now()
         return sum(self._position_liquidation_value(asset_id, timestamp=now) for asset_id in self._positions)
 
     def current_market_exposure(self) -> float:
+        if self.uses_live_execution():
+            return sum(position.cost_basis for position in self._positions.values())
         return sum(position.cost_basis for position in self._positions.values())
 
     def remaining_buy_budget(self) -> float:
         return max(self.max_market_exposure_usd - self.current_market_exposure(), 0.0)
 
     def unrealized_pnl(self) -> float:
+        if self.uses_live_execution():
+            return self.marked_open_value() - self.current_market_exposure()
         total = 0.0
         now = self.latest_underlying_timestamp or utc_now()
         for asset_id, position in self._positions.items():
@@ -1833,6 +2536,9 @@ class LivePaperStrategy:
         return (self.current_balance() / self.session_starting_balance) - 1.0
 
     def settle(self, *, timestamp: datetime, official_resolution: OfficialResolution | None = None) -> None:
+        if self.uses_live_execution():
+            self._recent_events.append("Live mode does not settle locally; waiting for Polymarket account state.")
+            return
         resolution_note = ""
         if official_resolution is not None:
             up_wins = official_resolution.up_wins
@@ -1858,6 +2564,7 @@ class LivePaperStrategy:
             payout_per_share = 1.0 if ((label.lower() == "up" and up_wins) or (label.lower() == "down" and not up_wins)) else 0.0
             proceeds = payout_per_share * position.shares
             realized = proceeds - position.cost_basis
+            holding_time_seconds = self._holding_time_seconds(asset_id, timestamp)
             self.cash += proceeds
             self.realized_pnl += realized
             self._record_closed_trade(position.shares, realized)
@@ -1878,6 +2585,20 @@ class LivePaperStrategy:
                 position_average_cost=0.0,
                 note=f"resolved {'Up' if up_wins else 'Down'}{resolution_note}",
                 recorded_at=timestamp,
+                matched_time_utc=timestamp.isoformat(),
+                seconds_to_expiry=0.0,
+                fair_value_at_decision=payout_per_share,
+                realized_pnl_on_close=realized,
+                holding_time_seconds=holding_time_seconds,
+                desired_price=payout_per_share,
+                actual_price=payout_per_share,
+                underlying_price_to_beat=self.start_underlying_price,
+                underlying_price_actual=self.latest_underlying_price,
+                time_left_seconds=0.0,
+                sigma_per_sqrt_s=self.sigma_per_sqrt_second(),
+                fair_up=self.fair_up_probability(timestamp),
+                execution_time_utc=timestamp.isoformat(),
+                account_value=self.current_balance(),
             )
             self._recent_events.append(
                 f"Settled {label} {position.shares:.0f} @ {payout_per_share:.2f}{resolution_note} | "
@@ -1885,6 +2606,7 @@ class LivePaperStrategy:
             )
             position.shares = 0.0
             position.cost_basis = 0.0
+            position.opened_at = None
 
     def render_dashboard(self) -> Group:
         now = utc_now()
@@ -1905,23 +2627,48 @@ class LivePaperStrategy:
         summary.add_column(justify="left", ratio=2)
 
         left_summary_rows = [
+            ("Mode", self.execution_mode),
             ("Market", self.market.title),
             ("Time Left", format_duration(remaining)),
             ("Balance", format_money(self.current_balance())),
             ("Cash", format_money(self.cash)),
-            ("Open Value", format_money(self.current_liquidation_value())),
-            (
-                "Exposure",
-                f"{format_money(self.current_market_exposure())} / {format_money(self.max_market_exposure_usd)}",
-            ),
-            (
-                "Lifetime Buys",
-                f"{format_money(self.market_buy_budget_used_usd)} / {format_money(self.max_market_exposure_usd)}",
-            ),
-            ("Realized", format_money(self.realized_pnl)),
-            ("Unrealized", format_money(self.unrealized_pnl())),
-            ("Trades", str(self.trade_count)),
         ]
+        if self.uses_live_execution():
+            left_summary_rows.extend(
+                [
+                    ("Marked Open", format_money(self.marked_open_value())),
+                    ("Exec Open", format_money(self.executable_open_value())),
+                    (
+                        "Reserved Cash",
+                        format_money(self.open_order_reserved_cash()),
+                    ),
+                    (
+                        "Exposure",
+                        f"{format_money(self.current_market_exposure())} / {format_money(self.max_market_exposure_usd)}",
+                    ),
+                    ("Realized", format_money(self.realized_pnl)),
+                    ("Unrealized", format_money(self.unrealized_pnl())),
+                    ("Trades", str(self.trade_count)),
+                ]
+            )
+        else:
+            left_summary_rows.extend(
+                [
+                    ("Open Value", format_money(self.current_liquidation_value())),
+                    (
+                        "Exposure",
+                        f"{format_money(self.current_market_exposure())} / {format_money(self.max_market_exposure_usd)}",
+                    ),
+                    (
+                        "Lifetime Buys",
+                        f"{format_money(self.market_buy_budget_used_usd)} / {format_money(self.max_market_exposure_usd)}",
+                    ),
+                    ("Realized", format_money(self.realized_pnl)),
+                    ("Unrealized", format_money(self.unrealized_pnl())),
+                    ("Trades", str(self.trade_count)),
+                ]
+            )
+
         right_summary_rows = [
             ("Market Max Alpha", f"{self.market_max_buy_alpha_net:.4f}"),
             (
@@ -1958,6 +2705,28 @@ class LivePaperStrategy:
             ),
             ("This Market", format_percent(market_return) if market_return is not None else "-"),
         ]
+        if self.uses_live_execution():
+            right_summary_rows.extend(
+                [
+                    (
+                        "Avg Buy Match ms",
+                        f"{self.average_live_buy_match_ms():.1f}" if self.average_live_buy_match_ms() is not None else "-",
+                    ),
+                    (
+                        "Avg Sell Match ms",
+                        f"{self.average_live_sell_match_ms():.1f}" if self.average_live_sell_match_ms() is not None else "-",
+                    ),
+                    ("Last Order", self.last_live_order_status()),
+                    (
+                        "Marked Total",
+                        format_money(self.marked_total_account_value()),
+                    ),
+                    (
+                        "Exec Total",
+                        format_money(self.executable_total_account_value()),
+                    ),
+                ]
+            )
         row_count = max(len(left_summary_rows), len(right_summary_rows))
         for index in range(row_count):
             left_label, left_value = left_summary_rows[index] if index < len(left_summary_rows) else ("", "")
@@ -1984,7 +2753,6 @@ class LivePaperStrategy:
         for asset_id in (self.up_asset_id, self.down_asset_id):
             book = self._books[asset_id]
             snapshot = up_snapshot if asset_id == self.up_asset_id else down_snapshot
-            position = self._positions[asset_id]
             books.add_row(
                 book.label,
                 f"{book.best_bid:.4f}" if book.best_bid is not None else "-",
@@ -1993,7 +2761,7 @@ class LivePaperStrategy:
                 f"{snapshot['fair_value']:.4f}" if snapshot["fair_value"] is not None else "-",
                 format_signed(snapshot["buy_alpha_net"]) if snapshot["buy_alpha_net"] is not None else "-",
                 format_signed(snapshot["sell_alpha_net"]) if snapshot["sell_alpha_net"] is not None else "-",
-                f"{position.shares:.0f}",
+                f"{self.position_shares(asset_id):.4f}" if self.position_shares(asset_id) > 0 else "0",
             )
 
         x_values = [
@@ -2086,6 +2854,8 @@ class LivePaperStrategy:
         return position.shares * self._liquidation_price(asset_id, timestamp=timestamp)
 
     def _trade_units(self, shares: float) -> float:
+        if self.uses_live_execution():
+            return 1.0 if shares > 1e-9 else 0.0
         if self.paper_trade_shares <= 0:
             return 0.0
         return max(shares / self.paper_trade_shares, 0.0)
@@ -2118,11 +2888,21 @@ class LivePaperStrategy:
         positions: list[dict[str, Any]] = []
 
         for asset_id, label in zip(self.market.token_ids, self.market.outcome_labels, strict=True):
-            position = self._positions[asset_id]
             book = self._books[asset_id]
             alpha = self.alpha_snapshot(asset_id, timestamp=snapshot_time)
-            liquidation_price = self._liquidation_price(asset_id, timestamp=snapshot_time)
-            liquidation_value = self._position_liquidation_value(asset_id, timestamp=snapshot_time)
+            if self.uses_live_execution():
+                shares = self.position_shares(asset_id)
+                avg_cost = self.position_average_cost(asset_id)
+                cost_basis = self.position_cost_basis(asset_id)
+                liquidation_price = self._live_executable_price(asset_id)
+                liquidation_value = shares * liquidation_price
+            else:
+                position = self._positions[asset_id]
+                liquidation_price = self._liquidation_price(asset_id, timestamp=snapshot_time)
+                liquidation_value = self._position_liquidation_value(asset_id, timestamp=snapshot_time)
+                shares = position.shares
+                avg_cost = position.average_cost
+                cost_basis = position.cost_basis
             row = {
                 "asset_id": asset_id,
                 "label": label,
@@ -2132,15 +2912,15 @@ class LivePaperStrategy:
                 "fair_value": alpha["fair_value"],
                 "buy_alpha_net": alpha["buy_alpha_net"],
                 "sell_alpha_net": alpha["sell_alpha_net"],
-                "shares": position.shares,
-                "avg_cost": position.average_cost,
-                "cost_basis": position.cost_basis,
+                "shares": shares,
+                "avg_cost": avg_cost,
+                "cost_basis": cost_basis,
                 "liquidation_price": liquidation_price,
                 "liquidation_value": liquidation_value,
-                "unrealized_pnl": liquidation_value - position.cost_basis,
+                "unrealized_pnl": liquidation_value - cost_basis,
             }
             books.append(row)
-            if position.shares > 0:
+            if shares > 0:
                 positions.append(row)
 
         return {
@@ -2158,6 +2938,7 @@ class LivePaperStrategy:
                 "outcome_labels": list(self.market.outcome_labels),
             },
             "summary": {
+                "execution_mode": self.execution_mode,
                 "cash": self.cash,
                 "balance": self.current_balance(),
                 "liquidation_value": self.current_liquidation_value(),
@@ -2174,8 +2955,17 @@ class LivePaperStrategy:
                 "market_max_buy_alpha_net": self.market_max_buy_alpha_net,
                 "initial_trade_taken": self.initial_trade_taken,
                 "paper_trade_shares": self.paper_trade_shares,
+                "live_buy_notional_usd": self.live_buy_notional_usd,
                 "min_alpha_net": self.min_alpha_net,
                 "max_position_shares": self.max_position_shares,
+                "open_order_reserved_cash_usdc": self.open_order_reserved_cash(),
+                "marked_open_value_usdc": self.marked_open_value(),
+                "executable_open_value_usdc": self.executable_open_value(),
+                "marked_total_account_value_usdc": self.marked_total_account_value(),
+                "executable_total_account_value_usdc": self.executable_total_account_value(),
+                "avg_buy_match_latency_ms": self.average_live_buy_match_ms(),
+                "avg_sell_match_latency_ms": self.average_live_sell_match_ms(),
+                "last_live_order": self._live_last_order_summary,
             },
             "books": books,
             "positions": positions,
@@ -2191,7 +2981,7 @@ class LivePaperStrategy:
     def _maybe_trade(self, timestamp: datetime) -> None:
         seconds_since_start = (timestamp - self.market.window_start).total_seconds()
         seconds_remaining = (self.market.window_end - timestamp).total_seconds()
-        queue_cutoff_seconds = NO_NEW_TRADES_LAST_SECONDS + MARKET_ORDER_EXECUTION_DELAY_SECONDS
+        queue_cutoff_seconds = NO_NEW_TRADES_LAST_SECONDS + self._current_queue_delay_seconds()
         if seconds_remaining <= queue_cutoff_seconds:
             if not self._late_trade_halt_logged:
                 self._recent_events.append(
@@ -2201,15 +2991,21 @@ class LivePaperStrategy:
             return
         for asset_id in (self.up_asset_id, self.down_asset_id):
             snapshot = self.alpha_snapshot(asset_id, timestamp=timestamp)
-            position = self._positions[asset_id]
             book = self._books[asset_id]
+            snapshot["decision_best_bid"] = book.best_bid
+            snapshot["decision_best_ask"] = book.best_ask
             if snapshot["buy_alpha_net"] is not None:
                 self.market_max_buy_alpha_net = max(self.market_max_buy_alpha_net, snapshot["buy_alpha_net"])
 
-            buy_fill = fill_buy_for_notional(
-                book.ask_levels,
-                target_notional=PAPER_TRADE_NOTIONAL_USD,
-            )
+            buy_fill = None
+            if self.uses_live_execution():
+                if book.best_ask is not None and self.cash >= self.live_buy_notional_usd:
+                    buy_fill = (self.live_buy_notional_usd / max(book.best_ask, 1e-9), self.live_buy_notional_usd, 0.0)
+            else:
+                buy_fill = fill_buy_for_notional(
+                    book.ask_levels,
+                    target_notional=PAPER_TRADE_NOTIONAL_USD,
+                )
             if (
                 snapshot["buy_alpha_net"] is not None
                 and buy_fill is not None
@@ -2235,7 +3031,11 @@ class LivePaperStrategy:
                     continue
 
                 self._recent_events.append(
-                    f"QUEUE BUY {book.label} after 500ms | alpha {snapshot['buy_alpha_net']:+.4f}"
+                    (
+                        f"QUEUE BUY {book.label} after 500ms | alpha {snapshot['buy_alpha_net']:+.4f}"
+                        if not self.uses_live_execution()
+                        else f"LIVE BUY {book.label} immediately | alpha {snapshot['buy_alpha_net']:+.4f}"
+                    )
                 )
                 self._schedule_market_order(
                     asset_id=asset_id,
@@ -2246,17 +3046,24 @@ class LivePaperStrategy:
                     is_initial_trade=is_initial_trade,
                 )
 
+            position_shares = self.position_shares(asset_id)
             allow_partial_position = (
                 book.best_bid is not None
                 and book.best_bid > 0
-                and position.shares * book.best_bid < PAPER_TRADE_NOTIONAL_USD
+                and position_shares * book.best_bid < self.trade_notional_usd()
             )
-            sell_fill = fill_sell_for_notional(
-                book.bid_levels,
-                target_notional=PAPER_TRADE_NOTIONAL_USD,
-                max_shares=position.shares,
-                allow_partial_position=allow_partial_position,
-            )
+            if self.uses_live_execution():
+                sell_fill = None
+                if position_shares > 1e-9 and book.best_bid is not None and book.best_bid > 0:
+                    target_shares = min(self.trade_notional_usd() / book.best_bid, position_shares)
+                    sell_fill = (target_shares, target_shares * book.best_bid, 0.0)
+            else:
+                sell_fill = fill_sell_for_notional(
+                    book.bid_levels,
+                    target_notional=PAPER_TRADE_NOTIONAL_USD,
+                    max_shares=position_shares,
+                    allow_partial_position=allow_partial_position,
+                )
             if (
                 snapshot["sell_alpha_net"] is not None
                 and sell_fill is not None
@@ -2265,7 +3072,11 @@ class LivePaperStrategy:
                 and self._cooldown_passed(asset_id, "sell", timestamp)
             ):
                 self._recent_events.append(
-                    f"QUEUE SELL {book.label} after 500ms | alpha {snapshot['sell_alpha_net']:+.4f}"
+                    (
+                        f"QUEUE SELL {book.label} after 500ms | alpha {snapshot['sell_alpha_net']:+.4f}"
+                        if not self.uses_live_execution()
+                        else f"LIVE SELL {book.label} immediately | alpha {snapshot['sell_alpha_net']:+.4f}"
+                    )
                 )
                 self._schedule_market_order(
                     asset_id=asset_id,
@@ -2289,7 +3100,7 @@ class LivePaperStrategy:
             milliseconds = int(raw_value)
         except (TypeError, ValueError):
             return utc_now()
-        return datetime.fromtimestamp(milliseconds / 1000, tz=UTC)
+        return datetime.fromtimestamp(milliseconds / 1000, tz=timezone.utc)
 
 
 async def live_dashboard(strategy: LivePaperStrategy, *, stop_event: asyncio.Event) -> None:
@@ -2323,49 +3134,25 @@ async def write_live_snapshots(
 
 
 DETAILED_CSV_FIELDNAMES = (
-    "recorded_at_utc",
-    "session_asset",
-    "session_event_id",
-    "session_market_id",
-    "session_condition_id",
-    "session_title",
-    "session_slug",
-    "window_start_utc",
-    "window_end_utc",
-    "row_kind",
-    "event_type",
-    "asset_id",
-    "market_address",
-    "message_timestamp_ms",
-    "message_hash",
+    "market_slug",
+    "market_id",
     "side",
-    "price",
-    "size",
-    "best_bid",
-    "best_ask",
-    "last_trade_price",
-    "tick_size",
-    "underlying_source",
-    "underlying_symbol",
-    "underlying_feed_id",
-    "underlying_timestamp_utc",
-    "underlying_price",
-    "underlying_bid",
-    "underlying_ask",
-    "token_label",
-    "fair_value",
-    "market_mid",
-    "buy_alpha_net",
-    "sell_alpha_net",
-    "paper_action",
-    "paper_shares",
-    "paper_fee",
-    "cash_balance",
-    "realized_pnl",
-    "position_shares",
-    "position_average_cost",
-    "note",
-    "raw_json",
+    "token",
+    "decision_timestamp_utc",
+    "matched_timestamp_utc",
+    "seconds_to_expiry",
+    "fair_value_at_decision",
+    "best_bid_at_decision",
+    "best_ask_at_decision",
+    "alpha_at_decision",
+    "matched_price",
+    "filled_shares",
+    "fee",
+    "realized_pnl_on_close",
+    "holding_time_seconds",
+    "entry_type",
+    "underlying_start_ref",
+    "underlying_current_ref",
 )
 
 
@@ -2395,75 +3182,13 @@ class CsvRecorder:
         temp_path.replace(self.snapshot_path)
 
     def write_session_row(self, row_kind: str, raw_payload: dict[str, Any] | None = None) -> None:
-        self.stats.session_rows += 1
-        self._write_row(
-            row_kind=row_kind,
-            event_type=row_kind,
-            raw_json=json.dumps(raw_payload or {}, separators=(",", ":"), sort_keys=True),
-        )
+        return
 
     def write_message(self, payload: dict[str, Any]) -> None:
-        self.stats.message_rows += 1
-        event_type = str(payload.get("event_type") or payload.get("type") or "unknown")
-        raw_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-        bids = payload.get("bids") if isinstance(payload.get("bids"), list) else []
-        asks = payload.get("asks") if isinstance(payload.get("asks"), list) else []
-
-        self._write_row(
-            row_kind="message",
-            event_type=event_type,
-            asset_id=str(payload.get("asset_id") or ""),
-            market_address=str(payload.get("market") or ""),
-            message_timestamp_ms=str(payload.get("timestamp") or ""),
-            message_hash=str(payload.get("hash") or ""),
-            best_bid=compute_best_price(bids, reverse=True),
-            best_ask=compute_best_price(asks),
-            last_trade_price=str(payload.get("last_trade_price") or payload.get("price") or ""),
-            tick_size=str(payload.get("tick_size") or ""),
-            raw_json=raw_json,
-        )
-
-        if bids:
-            self._write_levels(event_type=event_type, side="bid", asset_id=str(payload.get("asset_id") or ""), levels=bids)
-        if asks:
-            self._write_levels(event_type=event_type, side="ask", asset_id=str(payload.get("asset_id") or ""), levels=asks)
-
-        changes = payload.get("changes")
-        if isinstance(changes, list):
-            for change in changes:
-                if not isinstance(change, dict):
-                    continue
-                self.stats.change_level_rows += 1
-                self._write_row(
-                    row_kind="change_level",
-                    event_type=event_type,
-                    asset_id=str(payload.get("asset_id") or ""),
-                    market_address=str(payload.get("market") or ""),
-                    message_timestamp_ms=str(payload.get("timestamp") or ""),
-                    message_hash=str(payload.get("hash") or ""),
-                    side=str(change.get("side") or ""),
-                    price=str(change.get("price") or ""),
-                    size=str(change.get("size") or change.get("new_size") or ""),
-                    last_trade_price=str(payload.get("last_trade_price") or payload.get("price") or ""),
-                    tick_size=str(payload.get("tick_size") or ""),
-                    raw_json=raw_json,
-                )
+        return
 
     def write_underlying_quote(self, quote: UnderlyingQuote) -> None:
         self._latest_underlying = quote
-        self.stats.underlying_rows += 1
-        self._write_row(
-            row_kind="underlying_tick",
-            event_type="underlying_tick",
-            underlying_source=quote.source,
-            underlying_symbol=quote.symbol,
-            underlying_feed_id=quote.feed_id,
-            underlying_timestamp_utc=quote.timestamp.isoformat(),
-            underlying_price=quote.price,
-            underlying_bid=quote.bid,
-            underlying_ask=quote.ask,
-            raw_json=quote.raw_json,
-        )
 
     def write_paper_trade(
         self,
@@ -2484,102 +3209,180 @@ class CsvRecorder:
         position_average_cost: float,
         note: str,
         recorded_at: datetime,
+        decision_time_utc: str = "",
+        matched_time_utc: str = "",
+        seconds_to_expiry: float | None = None,
+        fair_value_at_decision: float | None = None,
+        best_bid_at_decision: float | None = None,
+        best_ask_at_decision: float | None = None,
+        alpha_at_decision: float | None = None,
+        realized_pnl_on_close: float | None = None,
+        holding_time_seconds: float | None = None,
+        entry_type: str = "",
+        desired_price: float | None = None,
+        actual_price: float | None = None,
+        trigger_alpha: float | None = None,
+        underlying_price_to_beat: float | None = None,
+        underlying_price_actual: float | None = None,
+        time_left_seconds: float | None = None,
+        sigma_per_sqrt_s: float | None = None,
+        fair_up: float | None = None,
+        execution_time_utc: str = "",
+        trade_number_in_market: int | None = None,
+        execution_delay_ms: float | None = None,
+        account_value: float | None = None,
         raw_json: str = "",
     ) -> None:
         self._write_row(
-            recorded_at_utc=recorded_at.isoformat(),
-            row_kind="paper_trade",
-            event_type="paper_trade",
-            asset_id=asset_id,
-            token_label=token_label,
-            price=f"{price:.6f}",
-            fair_value=f"{fair_value:.6f}" if fair_value is not None else "",
-            market_mid=f"{market_mid:.6f}" if market_mid is not None else "",
-            buy_alpha_net=f"{buy_alpha_net:.6f}" if buy_alpha_net is not None else "",
-            sell_alpha_net=f"{sell_alpha_net:.6f}" if sell_alpha_net is not None else "",
-            paper_action=action,
-            paper_shares=f"{shares:.4f}",
-            paper_fee=f"{fee:.6f}",
-            cash_balance=f"{cash_balance:.6f}",
-            realized_pnl=f"{realized_pnl:.6f}",
-            position_shares=f"{position_shares:.4f}",
-            position_average_cost=f"{position_average_cost:.6f}",
-            note=note,
-            raw_json=raw_json,
+            market_slug=self.market.slug,
+            market_id=self.market.market_id,
+            side=action,
+            token=token_label,
+            decision_timestamp_utc=decision_time_utc or recorded_at.isoformat(),
+            matched_timestamp_utc=matched_time_utc or recorded_at.isoformat(),
+            seconds_to_expiry=f"{seconds_to_expiry:.3f}" if seconds_to_expiry is not None else "",
+            fair_value_at_decision=(
+                f"{fair_value_at_decision:.6f}" if fair_value_at_decision is not None else ""
+            ),
+            best_bid_at_decision=f"{best_bid_at_decision:.6f}" if best_bid_at_decision is not None else "",
+            best_ask_at_decision=f"{best_ask_at_decision:.6f}" if best_ask_at_decision is not None else "",
+            alpha_at_decision=f"{alpha_at_decision:.6f}" if alpha_at_decision is not None else "",
+            matched_price=f"{actual_price if actual_price is not None else price:.6f}",
+            filled_shares=f"{shares:.6f}",
+            fee=f"{fee:.6f}",
+            realized_pnl_on_close=(
+                f"{realized_pnl_on_close:.6f}" if realized_pnl_on_close is not None else ""
+            ),
+            holding_time_seconds=f"{holding_time_seconds:.3f}" if holding_time_seconds is not None else "",
+            entry_type=entry_type,
+            underlying_start_ref=(
+                f"{underlying_price_to_beat:.6f}" if underlying_price_to_beat is not None else ""
+            ),
+            underlying_current_ref=(
+                f"{underlying_price_actual:.6f}" if underlying_price_actual is not None else ""
+            ),
         )
 
+    def write_live_trade(
+        self,
+        *,
+        asset_id: str,
+        token_label: str,
+        action: str,
+        requested_amount: float,
+        filled_shares: float,
+        matched_price: float,
+        fee: float,
+        fair_value: float | None,
+        market_mid: float | None,
+        buy_alpha_net: float | None,
+        sell_alpha_net: float | None,
+        cash_balance: float,
+        realized_pnl: float,
+        position_shares: float,
+        position_average_cost: float,
+        response_status: str,
+        order_id: str,
+        http_submit_latency_ms: float | None,
+        decision_to_http_response_ms: float | None,
+        decision_to_matched_ms: float | None,
+        decision_to_confirmed_ms: float | None,
+        note: str,
+        recorded_at: datetime,
+        decision_time_utc: str = "",
+        matched_time_utc: str = "",
+        seconds_to_expiry: float | None = None,
+        fair_value_at_decision: float | None = None,
+        best_bid_at_decision: float | None = None,
+        best_ask_at_decision: float | None = None,
+        alpha_at_decision: float | None = None,
+        realized_pnl_on_close: float | None = None,
+        holding_time_seconds: float | None = None,
+        entry_type: str = "",
+        desired_price: float | None = None,
+        actual_price: float | None = None,
+        trigger_alpha: float | None = None,
+        underlying_price_to_beat: float | None = None,
+        underlying_price_actual: float | None = None,
+        time_left_seconds: float | None = None,
+        sigma_per_sqrt_s: float | None = None,
+        fair_up: float | None = None,
+        execution_time_utc: str = "",
+        trade_number_in_market: int | None = None,
+        execution_delay_ms: float | None = None,
+        account_value: float | None = None,
+        raw_json: str = "",
+    ) -> None:
+        self._write_row(
+            market_slug=self.market.slug,
+            market_id=self.market.market_id,
+            side=action,
+            token=token_label,
+            decision_timestamp_utc=decision_time_utc or recorded_at.isoformat(),
+            matched_timestamp_utc=matched_time_utc or recorded_at.isoformat(),
+            seconds_to_expiry=f"{seconds_to_expiry:.3f}" if seconds_to_expiry is not None else "",
+            fair_value_at_decision=(
+                f"{fair_value_at_decision:.6f}" if fair_value_at_decision is not None else ""
+            ),
+            best_bid_at_decision=f"{best_bid_at_decision:.6f}" if best_bid_at_decision is not None else "",
+            best_ask_at_decision=f"{best_ask_at_decision:.6f}" if best_ask_at_decision is not None else "",
+            alpha_at_decision=f"{alpha_at_decision:.6f}" if alpha_at_decision is not None else "",
+            matched_price=f"{actual_price if actual_price is not None else matched_price:.6f}",
+            filled_shares=f"{filled_shares:.6f}",
+            fee=f"{fee:.6f}",
+            realized_pnl_on_close=(
+                f"{realized_pnl_on_close:.6f}" if realized_pnl_on_close is not None else ""
+            ),
+            holding_time_seconds=f"{holding_time_seconds:.3f}" if holding_time_seconds is not None else "",
+            entry_type=entry_type,
+            underlying_start_ref=(
+                f"{underlying_price_to_beat:.6f}" if underlying_price_to_beat is not None else ""
+            ),
+            underlying_current_ref=(
+                f"{underlying_price_actual:.6f}" if underlying_price_actual is not None else ""
+            ),
+        )
+
+    def write_market_resolution(
+        self,
+        *,
+        execution_mode: str,
+        resolved_outcome: str,
+        resolution_source: str,
+        price_to_beat: float | None,
+        final_price: float | None,
+        recorded_at: datetime,
+        cash_balance: float | None = None,
+        account_value: float | None = None,
+        raw_payload: dict[str, Any] | None = None,
+    ) -> None:
+        return
+
     def _write_levels(self, *, event_type: str, side: str, asset_id: str, levels: list[dict[str, Any]]) -> None:
-        for level in levels:
-            if not isinstance(level, dict):
-                continue
-            self.stats.book_level_rows += 1
-            self._write_row(
-                row_kind="book_level",
-                event_type=event_type,
-                asset_id=asset_id,
-                side=side,
-                price=str(level.get("price") or ""),
-                size=str(level.get("size") or ""),
-            )
+        return
 
     def _write_row(self, **overrides: str) -> None:
         row = {
-            "recorded_at_utc": utc_now().isoformat(),
-            "session_asset": self.market.asset,
-            "session_event_id": self.market.event_id,
-            "session_market_id": self.market.market_id,
-            "session_condition_id": self.market.condition_id,
-            "session_title": self.market.title,
-            "session_slug": self.market.slug,
-            "window_start_utc": self.market.window_start.isoformat(),
-            "window_end_utc": self.market.window_end.isoformat(),
-            "row_kind": "",
-            "event_type": "",
-            "asset_id": "",
-            "market_address": "",
-            "message_timestamp_ms": "",
-            "message_hash": "",
+            "market_slug": self.market.slug,
+            "market_id": self.market.market_id,
             "side": "",
-            "price": "",
-            "size": "",
-            "best_bid": "",
-            "best_ask": "",
-            "last_trade_price": "",
-            "tick_size": "",
-            "underlying_source": "",
-            "underlying_symbol": "",
-            "underlying_feed_id": "",
-            "underlying_timestamp_utc": "",
-            "underlying_price": "",
-            "underlying_bid": "",
-            "underlying_ask": "",
-            "token_label": "",
-            "fair_value": "",
-            "market_mid": "",
-            "buy_alpha_net": "",
-            "sell_alpha_net": "",
-            "paper_action": "",
-            "paper_shares": "",
-            "paper_fee": "",
-            "cash_balance": "",
-            "realized_pnl": "",
-            "position_shares": "",
-            "position_average_cost": "",
-            "note": "",
-            "raw_json": "",
+            "token": "",
+            "decision_timestamp_utc": "",
+            "matched_timestamp_utc": "",
+            "seconds_to_expiry": "",
+            "fair_value_at_decision": "",
+            "best_bid_at_decision": "",
+            "best_ask_at_decision": "",
+            "alpha_at_decision": "",
+            "matched_price": "",
+            "filled_shares": "",
+            "fee": "",
+            "realized_pnl_on_close": "",
+            "holding_time_seconds": "",
+            "entry_type": "",
+            "underlying_start_ref": "",
+            "underlying_current_ref": "",
         }
-        if self._latest_underlying is not None:
-            row.update(
-                {
-                    "underlying_source": self._latest_underlying.source,
-                    "underlying_symbol": self._latest_underlying.symbol,
-                    "underlying_feed_id": self._latest_underlying.feed_id,
-                    "underlying_timestamp_utc": self._latest_underlying.timestamp.isoformat(),
-                    "underlying_price": self._latest_underlying.price,
-                    "underlying_bid": self._latest_underlying.bid,
-                    "underlying_ask": self._latest_underlying.ask,
-                }
-            )
         row.update(overrides)
         if self.output_path is not None:
             self._row_buffer.append({key: str(value) for key, value in row.items()})
@@ -2638,6 +3441,46 @@ def fetch_assumed_resolution(market: MarketWindow) -> OfficialResolution | None:
     return None
 
 
+def build_market_resolution_payload(
+    *,
+    market: MarketWindow,
+    strategy: LivePaperStrategy,
+    official_resolution: OfficialResolution | None,
+    recorded_at: datetime,
+) -> dict[str, Any]:
+    if official_resolution is not None:
+        resolved_outcome = "Up" if official_resolution.up_wins else "Down"
+        resolution_source = "official"
+        price_to_beat = official_resolution.price_to_beat
+        final_price = official_resolution.final_price
+    elif strategy.start_underlying_price is not None and strategy.latest_underlying_price is not None:
+        resolved_outcome = "Up" if strategy.latest_underlying_price >= strategy.start_underlying_price else "Down"
+        resolution_source = "local_inference"
+        price_to_beat = strategy.start_underlying_price
+        final_price = strategy.latest_underlying_price
+    else:
+        resolved_outcome = "unknown"
+        resolution_source = "unknown"
+        price_to_beat = strategy.start_underlying_price
+        final_price = strategy.latest_underlying_price
+
+    return {
+        "market_id": market.market_id,
+        "slug": market.slug,
+        "title": market.title,
+        "execution_mode": strategy.execution_mode,
+        "resolved_outcome": resolved_outcome,
+        "resolution_source": resolution_source,
+        "price_to_beat": price_to_beat,
+        "final_price": final_price,
+        "window_start_utc": market.window_start.isoformat(),
+        "window_end_utc": market.window_end.isoformat(),
+        "recorded_at_utc": recorded_at.isoformat(),
+        "cash_balance": strategy.cash,
+        "account_value": strategy.current_balance(),
+    }
+
+
 async def stream_market(
     market: MarketWindow,
     recorder: CsvRecorder,
@@ -2688,6 +3531,7 @@ async def stream_market(
     recorder.write_session_row(
         "session_start",
         {
+            "execution_mode": strategy.execution_mode,
             "market_id": market.market_id,
             "slug": market.slug,
             "title": market.title,
@@ -2701,13 +3545,14 @@ async def stream_market(
             "underlying_stream_slug": underlying_config.stream_slug,
             "starting_balance": strategy.starting_balance,
             "paper_trade_shares": strategy.paper_trade_shares,
+            "live_buy_notional_usd": strategy.live_buy_notional_usd,
             "min_alpha_net": strategy.min_alpha_net,
             "max_position_shares": strategy.max_position_shares,
             "max_market_exposure_usd": strategy.max_market_exposure_usd,
         },
     )
-
     try:
+        await strategy.start_runtime()
         while utc_now() < session_deadline:
             try:
                 async with websockets.connect(
@@ -2746,6 +3591,7 @@ async def stream_market(
         underlying_stop.set()
         await underlying_task
         await strategy.cancel_pending_orders()
+        await strategy.stop_runtime()
         dashboard_stop.set()
         await dashboard_task
         log(
@@ -2753,7 +3599,28 @@ async def stream_market(
             label="CLOSE",
             tone="cyan",
         )
-        strategy.settle(timestamp=utc_now(), official_resolution=fetch_assumed_resolution(market))
+        resolution_timestamp = utc_now()
+        official_resolution = fetch_assumed_resolution(market)
+        resolution_payload = build_market_resolution_payload(
+            market=market,
+            strategy=strategy,
+            official_resolution=official_resolution,
+            recorded_at=resolution_timestamp,
+        )
+        recorder.write_market_resolution(
+            execution_mode=strategy.execution_mode,
+            resolved_outcome=str(resolution_payload["resolved_outcome"]),
+            resolution_source=str(resolution_payload["resolution_source"]),
+            price_to_beat=float_or_none(resolution_payload["price_to_beat"]),
+            final_price=float_or_none(resolution_payload["final_price"]),
+            recorded_at=resolution_timestamp,
+            cash_balance=strategy.cash,
+            account_value=strategy.current_balance(),
+            raw_payload=resolution_payload,
+        )
+        strategy.settle(timestamp=resolution_timestamp, official_resolution=official_resolution)
+        if strategy.uses_live_execution():
+            await strategy.refresh_live_state(force=True)
         snapshot_status["value"] = "settled"
         snapshot_stop.set()
         await snapshot_task
@@ -2764,6 +3631,28 @@ async def stream_market(
         started_at=started_at,
         finished_at=utc_now(),
     )
+
+
+async def wait_for_live_account_flat(
+    client: Any,
+    proxy_address: str,
+    *,
+    poll_seconds: float,
+    reason: str,
+) -> dict[str, Any]:
+    first_notice = True
+    while True:
+        state = await asyncio.to_thread(fetch_live_account_state, client, proxy_address)
+        if live_state_is_flat(state):
+            return state
+        if first_notice:
+            log(
+                f"{reason}. Live account not flat yet: {describe_live_state_guard(state)}. Waiting before trading the next market.",
+                label="LIVE",
+                tone="yellow",
+            )
+            first_notice = False
+        await asyncio.sleep(poll_seconds)
 
 
 async def wait_until(target: datetime, *, poll_seconds: int) -> None:
@@ -2793,16 +3682,48 @@ async def run(args: argparse.Namespace) -> None:
     recorded_count = 0
     session_balance = args.starting_balance
     session_starting_balance = args.starting_balance
+    session_started_at = utc_now()
+    live_env: dict[str, str] | None = None
+    live_client: Any | None = None
+    live_proxy_address = ""
     carry_forward_reference_price: float | None = None
     session_alpha_stats = SessionAlphaStats()
     session_performance_stats = SessionPerformanceStats()
     base_output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir = base_output_dir if args.write_csv else None
+    session_output_path = (
+        base_output_dir
+        / args.asset
+        / session_filename(
+            asset=args.asset,
+            execution_mode=args.execution_mode,
+            started_at=session_started_at,
+        )
+        if args.write_csv
+        else None
+    )
     summary_output_path = None if args.write_csv else base_output_dir / args.asset / "market_summary.csv"
     underlying_config = resolve_underlying_config(args.asset, args.underlying_source)
+    if args.execution_mode == "live":
+        try:
+            ensure_live_dependencies()
+            live_env = load_live_env(Path(args.env_file))
+            live_client = build_auth_client(live_env)
+            live_proxy_address = live_env["POLYMARKET_PROXY_ADDRESS"]
+            initial_live_state = await asyncio.to_thread(
+                fetch_live_account_state,
+                live_client,
+                live_proxy_address,
+            )
+            session_balance = float(initial_live_state["marked_total_account_value_usdc"])
+            session_starting_balance = session_balance
+        except LiveDependencyError as exc:
+            raise SystemExit(
+                "Missing live-trading dependency. Install requests and py-clob-client for --execution-mode live."
+            ) from exc
     print_banner(args.asset, output_dir, max_markets=args.max_markets, write_csv=args.write_csv)
     log(
-        f"Paper trader watching {args.asset} recurring 5-minute markets.",
+        f"{args.execution_mode.title()} trader watching {args.asset} recurring 5-minute markets.",
         label="READY",
         tone="cyan",
     )
@@ -2820,12 +3741,34 @@ async def run(args: argparse.Namespace) -> None:
             label="SOURCE",
             tone="dim",
         )
+    if session_output_path is not None:
+        log(
+            f"Session CSV enabled at {session_output_path} (appends all markets until this run stops).",
+            label="CSV",
+            tone="dim",
+        )
     if summary_output_path is not None:
         log(
             f"Summary CSV enabled at {summary_output_path} (one row per market).",
             label="SUMMARY",
             tone="dim",
         )
+    if args.execution_mode == "live":
+        log(
+            f"Live baseline locked to {format_money(session_starting_balance)} using Polymarket account state.",
+            label="LIVE",
+            tone="cyan",
+        )
+        if not live_state_is_flat(initial_live_state):
+            log(
+                (
+                    "Live account already has unresolved state at startup: "
+                    f"{describe_live_state_guard(initial_live_state)}. "
+                    "Continuing anyway."
+                ),
+                label="LIVE",
+                tone="yellow",
+            )
 
     while True:
         cycle_number = recorded_count + 1
@@ -2859,7 +3802,7 @@ async def run(args: argparse.Namespace) -> None:
             return
 
         now = utc_now()
-        output_path = output_dir / args.asset / window_filename(market) if output_dir is not None else None
+        output_path = session_output_path
         if now < market.window_start:
             log_market_window(
                 cycle_number,
@@ -2892,19 +3835,40 @@ async def run(args: argparse.Namespace) -> None:
             tone="green",
             output_path=output_path,
         )
+        if args.execution_mode == "live":
+            assert live_client is not None
+            assert live_proxy_address
+            live_state = await asyncio.to_thread(
+                fetch_live_account_state,
+                live_client,
+                live_proxy_address,
+            )
+            session_balance = float(live_state["marked_total_account_value_usdc"])
+            if not live_state_is_flat(live_state):
+                log(
+                    (
+                        f"Starting {market.slug} with unresolved live state: "
+                        f"{describe_live_state_guard(live_state)}."
+                    ),
+                    label="LIVE",
+                    tone="yellow",
+                )
         recorder = CsvRecorder(output_path=output_path, market=market)
         strategy = LivePaperStrategy(
             market=market,
             recorder=recorder,
+            execution_mode=args.execution_mode,
             starting_balance=session_balance,
             session_starting_balance=session_starting_balance,
             paper_trade_shares=args.paper_trade_shares,
+            live_buy_notional_usd=args.live_buy_notional_usd,
             min_alpha_net=args.min_alpha_net,
             max_position_shares=args.max_position_shares,
             max_market_exposure_usd=args.max_market_exposure_usd,
             historical_average_max_alpha=session_alpha_stats.average_max_alpha,
             session_performance_stats=session_performance_stats,
             trade_cooldown_seconds=args.trade_cooldown_seconds,
+            env_file=args.env_file,
         )
         if carry_forward_reference_price is not None:
             strategy.seed_reference_price(
@@ -2945,6 +3909,15 @@ async def run(args: argparse.Namespace) -> None:
         processed_market_ids.add(market.market_id)
         recorded_count += 1
         session_balance = strategy.current_balance()
+        if args.execution_mode == "live" and not strategy.live_account_is_flat():
+            log(
+                (
+                    f"Post-market state for {market.slug}: {strategy.live_guard_note()}. "
+                    "Continuing to the next market while prior positions await resolution."
+                ),
+                label="LIVE",
+                tone="yellow",
+            )
         carry_forward_reference_price = strategy.latest_underlying_price
         session_alpha_stats = session_alpha_stats.with_market(strategy.market_max_buy_alpha_net)
         session_performance_stats = session_performance_stats.with_market(strategy.current_market_performance())
@@ -3033,6 +4006,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Persist market, underlying, and paper trade rows to CSV.",
     )
     parser.add_argument(
+        "--execution-mode",
+        choices=["paper", "live"],
+        default="paper",
+        help="Execution backend. Paper keeps local simulated fills; live submits real Polymarket orders.",
+    )
+    parser.add_argument(
+        "--env-file",
+        default=".env",
+        help="Path to Polymarket credentials used by --execution-mode live.",
+    )
+    parser.add_argument(
         "--discovery-poll-seconds",
         type=int,
         default=15,
@@ -3059,13 +4043,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--starting-balance",
         type=float,
         default=50.0,
-        help="Starting paper balance in USD.",
+        help="Starting paper balance in USD. Ignored in live mode.",
     )
     parser.add_argument(
         "--paper-trade-shares",
         type=float,
         default=1.0,
-        help="Shares to buy or sell per paper trade.",
+        help="Shares to buy or sell per paper trade. Used only in paper mode analytics.",
+    )
+    parser.add_argument(
+        "--live-buy-notional-usd",
+        type=float,
+        default=1.0,
+        help="Fixed USD notional for each live buy. Live sells target the same notional, capped by available shares.",
     )
     parser.add_argument(
         "--min-alpha-net",

@@ -1,5 +1,5 @@
 {
-  "generated_at_utc": "2026-04-17T11:32:51.973775+00:00",
+  "generated_at_utc": "2026-04-17T11:33:19.870849+00:00",
   "market": {
     "question": "Ethereum Up or Down - April 17, 7:30AM-7:35AM ET",
     "slug": "eth-updown-5m-1776425400",
@@ -29,32 +29,32 @@
       "token_id": "63617366751848784934382168482891959608489101709482172319649702776666968758047",
       "outcome": "Up",
       "market_meta_price": "0.51",
-      "buy_quote_price": "0.89",
-      "sell_quote_price": "0.9"
+      "buy_quote_price": "0.78",
+      "sell_quote_price": "0.79"
     },
     {
       "token_id": "112629224787701515077610067848151537865340569615654916948892462356813405390558",
       "outcome": "Down",
       "market_meta_price": "0.49",
-      "buy_quote_price": "0.1",
-      "sell_quote_price": "0.13"
+      "buy_quote_price": "0.21",
+      "sell_quote_price": "0.22"
     }
   ],
   "chosen_outcome": {
     "token_id": "63617366751848784934382168482891959608489101709482172319649702776666968758047",
     "outcome": "Up",
-    "price": "0.89",
+    "price": "0.78",
     "market_meta_price": "0.51",
-    "sell_quote_price": "0.9"
+    "sell_quote_price": "0.79"
   },
   "buy_size_check": {
     "requested_notional_usd": "1",
-    "estimated_shares_at_buy_quote": "1.12359550561797752808988764",
+    "estimated_shares_at_buy_quote": "1.282051282051282051282051282",
     "minimum_order_size_shares": "5",
     "meets_minimum_share_size": false
   },
   "pre_trade_snapshot": {
-    "captured_at_utc": "2026-04-17T11:32:51.973452+00:00",
+    "captured_at_utc": "2026-04-17T11:33:19.870202+00:00",
     "cash_balance_usdc": "49.635152",
     "cash_balance_micro_usdc": "49635152",
     "open_orders_count": 0,
@@ -76,5 +76,46 @@
       "https://docs.polymarket.com/trading/orders/create"
     ]
   },
-  "live_execution": "skipped"
+  "live_execution": "failed",
+  "error": "",
+  "post_trade_snapshot": {
+    "captured_at_utc": "2026-04-17T11:33:36.816683+00:00",
+    "cash_balance_usdc": "48.635154",
+    "cash_balance_micro_usdc": "48635154",
+    "open_orders_count": 0,
+    "open_order_reserved_cash_usdc": "0",
+    "total_position_value_usdc": "0.5877",
+    "free_cash_usdc": "48.635154",
+    "market_positions_count": 1,
+    "market_positions": [
+      {
+        "proxyWallet": "0x288d3c0a69966ef5b8b6549232e5b8e52b2cf517",
+        "asset": "63617366751848784934382168482891959608489101709482172319649702776666968758047",
+        "conditionId": "0x5e0aa026be3a7a43ac41343d465b4074893e70797fe64c7c756646d2a0d1ec48",
+        "size": 1.1637,
+        "avgPrice": 0.8499,
+        "initialValue": 0.9892,
+        "currentValue": 0.5877,
+        "cashPnl": -0.4015,
+        "percentPnl": -40.5882,
+        "totalBought": 1.1764,
+        "realizedPnl": 0,
+        "percentRealizedPnl": -41.2298,
+        "curPrice": 0.505,
+        "redeemable": false,
+        "mergeable": false,
+        "title": "Ethereum Up or Down - April 17, 7:30AM-7:35AM ET",
+        "slug": "eth-updown-5m-1776425400",
+        "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/ETH+fullsize.jpg",
+        "eventId": "385027",
+        "eventSlug": "eth-updown-5m-1776425400",
+        "outcome": "Up",
+        "outcomeIndex": 0,
+        "oppositeOutcome": "Down",
+        "oppositeAsset": "112629224787701515077610067848151537865340569615654916948892462356813405390558",
+        "endDate": "2026-04-17",
+        "negativeRisk": false
+      }
+    ]
+  }
 }

@@ -7,7 +7,7 @@ import json
 import math
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from typing import Any, Callable
@@ -41,7 +41,7 @@ def load_env(path: Path) -> dict[str, str]:
 
 
 def utc_now() -> datetime:
-    return datetime.now(UTC)
+    return datetime.now(timezone.utc)
 
 
 def iso_to_dt(value: str | None) -> datetime | None:
@@ -356,6 +356,47 @@ def choose_market_side(market_meta: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def fetch_token_quotes(client: ClobClient, market_meta: dict[str, Any]) -> list[dict[str, Any]]:
+    tokens = market_meta.get("tokens") or []
+    quotes: list[dict[str, Any]] = []
+    for token in tokens:
+        token_id = str(token["token_id"])
+        buy_quote: Decimal | None = None
+        sell_quote: Decimal | None = None
+        try:
+            buy_quote = Decimal(str(client.get_price(token_id, "BUY")["price"]))
+        except Exception:  # noqa: BLE001
+            buy_quote = None
+        try:
+            sell_quote = Decimal(str(client.get_price(token_id, "SELL")["price"]))
+        except Exception:  # noqa: BLE001
+            sell_quote = None
+        quotes.append(
+            {
+                "token_id": token_id,
+                "outcome": str(token["outcome"]),
+                "market_meta_price": Decimal(str(token.get("price", 0))),
+                "buy_quote_price": buy_quote,
+                "sell_quote_price": sell_quote,
+            }
+        )
+    return quotes
+
+
+def choose_market_side_from_quotes(token_quotes: list[dict[str, Any]]) -> dict[str, Any]:
+    priced = [quote for quote in token_quotes if quote["buy_quote_price"] is not None]
+    if not priced:
+        raise RuntimeError("No executable BUY quote was available for any token.")
+    chosen = max(priced, key=lambda quote: quote["buy_quote_price"])
+    return {
+        "token_id": str(chosen["token_id"]),
+        "outcome": str(chosen["outcome"]),
+        "price": chosen["buy_quote_price"],
+        "market_meta_price": chosen["market_meta_price"],
+        "sell_quote_price": chosen["sell_quote_price"],
+    }
+
+
 def build_worst_price(current_price: Decimal, tick_size: Decimal, *, side: str) -> Decimal:
     buffer = Decimal("0.20")
     if side == "BUY":
@@ -477,8 +518,11 @@ async def async_main(args: argparse.Namespace) -> int:
     market = discover_active_5m_market(args.asset)
     client = build_auth_client(env)
     market_meta = await asyncio.to_thread(client.get_market, market.condition_id)
-    chosen = choose_market_side(market_meta)
+    token_quotes = await asyncio.to_thread(fetch_token_quotes, client, market_meta)
+    chosen = choose_market_side_from_quotes(token_quotes)
     tick_size = Decimal(str(market_meta["minimum_tick_size"]))
+    minimum_order_size = Decimal(str(market_meta["minimum_order_size"]))
+    estimated_buy_shares = args.amount_usd / chosen["price"]
 
     pre_snapshot = await asyncio.to_thread(
         fetch_snapshot, client, env["POLYMARKET_PROXY_ADDRESS"], market.condition_id
@@ -495,8 +539,23 @@ async def async_main(args: argparse.Namespace) -> int:
             "minimum_tick_size": market_meta.get("minimum_tick_size"),
             "tokens": market_meta.get("tokens"),
         },
-        "decision_rule": "Buy the currently higher-priced outcome on the active 5-minute market.",
+        "decision_rule": "Buy the currently higher-priced outcome using executable CLOB BUY quotes, not market metadata prices.",
+        "token_quotes": [
+            {
+                **quote,
+                "market_meta_price": decimal_str(quote["market_meta_price"]),
+                "buy_quote_price": decimal_str(quote["buy_quote_price"]) if quote["buy_quote_price"] is not None else None,
+                "sell_quote_price": decimal_str(quote["sell_quote_price"]) if quote["sell_quote_price"] is not None else None,
+            }
+            for quote in token_quotes
+        ],
         "chosen_outcome": chosen,
+        "buy_size_check": {
+            "requested_notional_usd": decimal_str(args.amount_usd),
+            "estimated_shares_at_buy_quote": decimal_str(estimated_buy_shares),
+            "minimum_order_size_shares": decimal_str(minimum_order_size),
+            "meets_minimum_share_size": estimated_buy_shares >= minimum_order_size,
+        },
         "pre_trade_snapshot": pre_snapshot,
         "docs_notes": {
             "balance_allowance_endpoint_tracks_cash_collateral": True,
@@ -550,12 +609,8 @@ async def async_main(args: argparse.Namespace) -> int:
 
             await asyncio.sleep(args.hold_seconds)
 
-            refreshed_market = await asyncio.to_thread(client.get_market, market.condition_id)
-            refreshed_tokens = refreshed_market.get("tokens") or []
-            refreshed_price = next(
-                Decimal(str(token["price"]))
-                for token in refreshed_tokens
-                if str(token["token_id"]) == chosen["token_id"]
+            refreshed_sell_price = Decimal(
+                str((await asyncio.to_thread(client.get_price, chosen["token_id"], "SELL"))["price"])
             )
 
             if visible_position is None:
@@ -570,14 +625,16 @@ async def async_main(args: argparse.Namespace) -> int:
                 side="SELL",
                 amount=position_size,
                 order_type=OrderType.FAK,
-                current_price=refreshed_price,
+                current_price=refreshed_sell_price,
                 tick_size=tick_size,
             )
             result["sell_order"] = sell_result
     except Exception as exc:  # noqa: BLE001
         exit_code = 1
         result["live_execution"] = "failed"
+        result["error_type"] = type(exc).__name__
         result["error"] = str(exc)
+        result["error_repr"] = repr(exc)
     finally:
         result["post_trade_snapshot"] = await asyncio.to_thread(
             fetch_snapshot, client, env["POLYMARKET_PROXY_ADDRESS"], market.condition_id
