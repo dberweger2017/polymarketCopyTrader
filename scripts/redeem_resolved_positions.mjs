@@ -4,7 +4,6 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { BuilderConfig } from "../frontend/node_modules/@polymarket/builder-signing-sdk/dist/index.js";
 import { RelayClient, RelayerTxType } from "../frontend/node_modules/@polymarket/builder-relayer-client/dist/index.js";
 import { createWalletClient, encodeFunctionData, http, zeroHash } from "../frontend/node_modules/viem/_esm/index.js";
 import { privateKeyToAccount } from "../frontend/node_modules/viem/_esm/accounts/index.js";
@@ -91,7 +90,7 @@ function loadRedeemTargets(repoRoot, envFile) {
     if (row.status !== "resolved") {
       continue;
     }
-    if (!row.closed || !row.winning_outcome) {
+    if (!row.redeemable) {
       continue;
     }
     if (!unique.has(row.condition_id)) {
@@ -100,6 +99,7 @@ function loadRedeemTargets(repoRoot, envFile) {
         title: row.title,
         slug: row.slug,
         winningOutcome: row.winning_outcome,
+        token: row.token,
       });
     }
   }
@@ -135,20 +135,14 @@ async function main() {
     chain: polygon,
     transport: http(env.POLYGON_RPC_URL || "https://polygon-rpc.com"),
   });
-  const builderConfig = new BuilderConfig({
-    localBuilderCreds: {
-      key: env.POLYMARKET_BUILDER_API_KEY,
-      secret: env.POLYMARKET_BUILDER_API_SECRET,
-      passphrase: env.POLYMARKET_BUILDER_API_PASSPHRASE,
-    },
+  const relayClient = new RelayClient({
+    host: RELAYER_URL,
+    chain: CHAIN_ID,
+    signer: wallet,
+    relayerApiKey: env.POLYMARKET_RELAYER_API_KEY,
+    relayerApiKeyAddress: env.POLYMARKET_RELAYER_API_KEY_ADDRESS,
+    txType: RelayerTxType.PROXY,
   });
-  const relayClient = new RelayClient(
-    RELAYER_URL,
-    CHAIN_ID,
-    wallet,
-    builderConfig,
-    RelayerTxType.PROXY,
-  );
 
   const successes = [];
   const failures = [];
